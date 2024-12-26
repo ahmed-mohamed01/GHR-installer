@@ -899,68 +899,41 @@ get_apt_version() {
     fi
 }
 
-# Test database operations
-test_db_ops() {
-    local test_dir="/tmp/ghr-installer-test"
-    local old_data_dir="$DATA_DIR"
-    local old_db_file="$DB_FILE"
+# Function to list installed packages
+list_installed_packages() {
+    local db_content
+    db_content=$(read_db)
     
-    # Set up test environment
-    DATA_DIR="$test_dir"
-    DB_FILE="$DATA_DIR/ghr-installer.db"
-    mkdir -p "$DATA_DIR"
+    print_color "$BOLD" "Packages managed by ghr-installer:"
+    printf "\n%-15s %-12s %-s\n" "Package" "Version" "Migration"
+    echo "----------------------------------------"
     
-    echo -e "\nTesting database operations..."
+    # Get all package names and filter out invalid entries
+    local packages
+    packages=$(echo "$db_content" | jq -r '.packages | keys[] | select(test("^[a-zA-Z0-9_-]+$"))' 2>/dev/null | sort)
     
-    # Test 1: Adding a package
-    add_to_db "test-pkg" "1.0.0" "/usr/local/bin/test" "/usr/local/share/man/man1/test.1"
-    echo -e "\nTest 1: Adding package"
-    check_installation_status "test-pkg"
-    local status=$?
-    echo "Status code: $status (expect 3 - files missing)"
-    
-    # Test 2: Non-existent package
-    echo -e "\nTest 2: Checking non-existent package"
-    check_installation_status "nonexistent-pkg"
-    status=$?
-    echo "Status code: $status (expect 1 - not installed)"
-    
-    # Test 3: System-installed package
-    echo -e "\nTest 3: Checking system package"
-    check_installation_status "ls"
-    status=$?
-    echo "Status code: $status (expect 2 - installed but not managed)"
-    
-    # Test 4: Package with missing files
-    echo -e "\nTest 4: Package with missing files"
-    # Create test binary
-    mkdir -p "$test_dir/bin"
-    touch "$test_dir/bin/test-pkg-2"
-    chmod +x "$test_dir/bin/test-pkg-2"
-    add_to_db "test-pkg-2" "1.0.0" "$test_dir/bin/test-pkg-2"
-    check_installation_status "test-pkg-2"
-    status=$?
-    echo "Status code: $status (expect 0 - properly installed)"
-    
-    # Remove the binary and check again
-    rm "$test_dir/bin/test-pkg-2"
-    check_installation_status "test-pkg-2"
-    status=$?
-    echo "Status code: $status (expect 3 - files missing)"
-    
-    # Clean up
-    rm -rf "$test_dir"
-    DATA_DIR="$old_data_dir"
-    DB_FILE="$old_db_file"
+    # Process each package
+    while IFS= read -r package; do
+        [ -z "$package" ] && continue
+        local version
+        version=$(echo "$db_content" | jq -r --arg pkg "$package" '.packages[$pkg].version' 2>/dev/null)
+        local apt_ver
+        apt_ver=$(get_apt_version "$package")
+        local migration_info=""
+        if [ "$apt_ver" != "not found" ]; then
+            migration_info="APT $apt_ver available"
+        fi
+        printf "%-15s %-12s %s\n" "$package" "$version" "$migration_info"
+    done <<< "$packages"
 }
 
 # Print usage information
 usage() {
     print_color "$BOLD" "Usage: $0 [OPTIONS]"
-    echo
     print_color "$BOLD" "Options:"
     print_color "$BOLD" "  --update PACKAGE    Update specified package"
     print_color "$BOLD" "  --remove PACKAGE    Remove specified package"
+    print_color "$BOLD" "  --list             List installed packages"
     print_color "$BOLD" "  --help             Show this help message"
     echo
     print_color "$BOLD" "Without options, runs in interactive mode"
@@ -995,6 +968,10 @@ main() {
                 exit 1
             fi
             remove_package "$2"
+            exit 0
+            ;;
+        --list|-l)
+            list_installed_packages
             exit 0
             ;;
         --help|-h)
