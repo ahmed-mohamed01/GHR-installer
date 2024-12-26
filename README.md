@@ -12,6 +12,13 @@ A powerful bash script to manage and install binaries from GitHub releases along
 - File locking for concurrent access safety
 - JSON-based package database
 
+./installer.sh --update: Checks for updates from installed source (GitHub or APT) for all installed packages
+./installer.sh --update fzf: Checks for updates for fzf from its current source
+./installer.sh --update --all-sources: Checks for updates from both GitHub and APT for all installed packages
+./installer.sh --list: Shows only packages installed by ghr-installer
+./installer.sh (no args): Enters interactive mode, which shows available packages from repos.txt
+
+
 ## Installation
 
 1. Clone this repository:
@@ -55,21 +62,10 @@ The installer maintains a JSON database at `~/.local/ghr-installer/ghr-installer
 - File locations
 - Version tracking
 
-## Supported Packages
-
-Currently supports:
-- fzf (Command-line fuzzy finder)
-- micro (Modern terminal-based text editor)
-- zoxide (Smarter cd command)
-- eza (Modern replacement for ls)
-- fd (Simple, fast alternative to find)
-
 ## Requirements
 
-- bash
-- curl
 - jq (for JSON processing)
-- apt (for APT package management)
+
 
 ## Security
 
@@ -77,9 +73,8 @@ Currently supports:
 - Verifies downloads using checksums when available
 - Supports GITHUB_TOKEN for authenticated API access
 
-## Example Output
-
-Here's what you'll see when installing fzf from GitHub releases:
+## Example
+Istalling fzf from Github.
 
 ```
 Processing repositories:

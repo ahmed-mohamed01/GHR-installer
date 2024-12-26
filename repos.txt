@@ -1,6 +1,4 @@
-
-# This is a comment
-
+# GitHub repositories to install
 junegunn/fzf
 zyedidia/micro
 ajeetdsouza/zoxide
