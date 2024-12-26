@@ -60,6 +60,56 @@ unlock_db() {
     rm -f "$DATA_DIR/ghr-installer.lock"
 }
 
+# Database operations wrapper
+db_ops() {
+    local operation=$1
+    shift
+
+    case "$operation" in
+        get)
+            local key=$1
+            if [ ! -f "$DB_FILE" ]; then
+                echo '{}'
+                return
+            fi
+            jq -r --arg key "$key" '.packages[$key] // empty' "$DB_FILE"
+            ;;
+        set)
+            local key=$1
+            local value=$2
+            mkdir -p "$(dirname "$DB_FILE")"
+            if [ ! -f "$DB_FILE" ]; then
+                echo '{"version":1,"packages":{}}' > "$DB_FILE"
+            fi
+            local temp_file="${DB_FILE}.tmp"
+            jq --arg key "$key" --argjson value "$value" '.packages[$key] = $value' "$DB_FILE" > "$temp_file"
+            mv "$temp_file" "$DB_FILE"
+            ;;
+        delete)
+            local key=$1
+            if [ -f "$DB_FILE" ]; then
+                local temp_file="${DB_FILE}.tmp"
+                jq --arg key "$key" 'del(.packages[$key])' "$DB_FILE" > "$temp_file"
+                mv "$temp_file" "$DB_FILE"
+            fi
+            ;;
+        list)
+            if [ ! -f "$DB_FILE" ]; then
+                return
+            fi
+            jq -r '.packages | keys[]' "$DB_FILE"
+            ;;
+        query)
+            local query=$1
+            if [ ! -f "$DB_FILE" ]; then
+                echo '{}'
+                return
+            fi
+            jq "$query" "$DB_FILE"
+            ;;
+    esac
+}
+
 # Function to read database
 read_db() {
     if [ ! -f "$DB_FILE" ]; then
@@ -88,27 +138,14 @@ add_to_db() {
         return 1
     fi
     
-    # Read current database
-    local db_content=$(read_db)
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local entry=$(jq -n \
+        --arg ver "$version" \
+        --argjson files "$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)" \
+        --arg ts "$timestamp" \
+        '{version: $ver, files: $files, installed_at: $ts, updated_at: $ts}')
     
-    # Create new entry with proper JSON escaping
-    local files_json="["
-    for ((i=0; i<${#files[@]}; i++)); do
-        files_json+="\"${files[i]}\""
-        if [ $i -lt $((${#files[@]}-1)) ]; then
-            files_json+=","
-        fi
-    done
-    files_json+="]"
-    
-    local new_entry="{\"version\":\"$version\",\"files\":$files_json,\"installed_at\":\"$timestamp\",\"updated_at\":\"$timestamp\"}"
-    
-    # Update database
-    db_content=$(echo "$db_content" | jq --arg pkg "$package" --argjson entry "$new_entry" '.packages[$pkg] = $entry')
-    
-    # Write back to database
-    write_db "$db_content"
+    db_ops set "$package" "$entry"
     unlock_db
 }
 
@@ -120,22 +157,14 @@ remove_from_db() {
         return 1
     fi
     
-    # Read current database
-    local db_content=$(read_db)
-    
-    # Remove package
-    db_content=$(echo "$db_content" | jq --arg pkg "$package" 'del(.packages[$pkg])')
-    
-    # Write back to database
-    write_db "$db_content"
+    db_ops delete "$package"
     unlock_db
 }
 
 # Function to get package info from database
 get_package_info() {
     local package=$1
-    local db_content=$(read_db)
-    echo "$db_content" | jq -r --arg pkg "$package" '.packages[$pkg] // empty'
+    db_ops get "$package"
 }
 
 # Function to check if a package is installed via ghr-installer
@@ -806,6 +835,55 @@ get_apt_version() {
     else
         echo "$version"
     fi
+}
+
+# Test database operations
+test_db_ops() {
+    local test_dir="/tmp/ghr-installer-test"
+    local old_data_dir="$DATA_DIR"
+    local old_db_file="$DB_FILE"
+    
+    # Set up test environment
+    DATA_DIR="$test_dir"
+    DB_FILE="$DATA_DIR/ghr-installer.db"
+    mkdir -p "$DATA_DIR"
+    
+    echo "Testing database operations..."
+    
+    # Test adding a package
+    add_to_db "test-pkg" "1.0.0" "/usr/local/bin/test" "/usr/local/share/man/man1/test.1"
+    echo "Added test package"
+    
+    # Test getting package info
+    local info=$(get_package_info "test-pkg")
+    echo "Package info: $info"
+    
+    # Test checking installation
+    if check_installed "test-pkg"; then
+        echo "Package check: OK"
+    else
+        echo "Package check: Failed"
+    fi
+    
+    # Test getting version
+    local version=$(get_installed_version "test-pkg")
+    echo "Installed version: $version"
+    
+    # Test removing package
+    remove_from_db "test-pkg"
+    echo "Removed package"
+    
+    # Verify removal
+    if ! check_installed "test-pkg"; then
+        echo "Package removal: OK"
+    else
+        echo "Package removal: Failed"
+    fi
+    
+    # Clean up
+    rm -rf "$test_dir"
+    DATA_DIR="$old_data_dir"
+    DB_FILE="$old_db_file"
 }
 
 # Print usage information
