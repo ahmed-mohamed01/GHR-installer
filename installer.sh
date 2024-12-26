@@ -175,12 +175,13 @@ check_installed() {
         return 1
     fi
     
-    local info=$(get_package_info "$package")
-    if [ -z "$info" ] || [ "$info" = "null" ]; then
-        print_color "$YELLOW" "Package $package was not installed using ghr-installer"
-        return 1
-    fi
-    return 0
+    check_installation_status "$package"
+    local status=$?
+    
+    case $status in
+        0) return 0 ;;  # Properly installed
+        *) return 1 ;;  # Any other status is considered not installed
+    esac
 }
 
 # Function to get current installed version
@@ -224,6 +225,67 @@ remove_package() {
         echo "You can check for orphaned packages using:"
         print_color "$YELLOW" "sudo apt autoremove"
     fi
+}
+
+# Function to check if binary exists in PATH
+check_binary_exists() {
+    local binary=$1
+    if ! command -v "$binary" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+# Function to check if all files from installation exist
+check_files_exist() {
+    local package=$1
+    local info=$(get_package_info "$package")
+    
+    if [ -z "$info" ] || [ "$info" = "null" ]; then
+        return 1
+    fi
+    
+    local all_files_exist=true
+    while IFS= read -r file; do
+        if [ ! -f "$file" ]; then
+            all_files_exist=false
+            break
+        fi
+    done <<< "$(echo "$info" | jq -r '.files[]')"
+    
+    if [ "$all_files_exist" = false ]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check installation status
+check_installation_status() {
+    local package=$1
+    local info=$(get_package_info "$package")
+    
+    # First check if it's in our database
+    if [ -z "$info" ] || [ "$info" = "null" ]; then
+        # Not in database, check if binary exists
+        if check_binary_exists "$package"; then
+            print_color "$YELLOW" "Package $package is installed but not managed by ghr-installer"
+            return 2  # Installed but not managed
+        else
+            print_color "$YELLOW" "Package $package is not installed"
+            return 1  # Not installed
+        fi
+    fi
+    
+    # In database, verify all files exist
+    if ! check_files_exist "$package"; then
+        print_color "$YELLOW" "Package $package was installed via ghr-installer but files have been removed"
+        return 3  # Files missing
+    fi
+    
+    # Everything is good
+    print_color "$GREEN" "Package $package is installed and managed by ghr-installer"
+    return 0  # Properly installed
 }
 
 # Initialize database
@@ -848,37 +910,43 @@ test_db_ops() {
     DB_FILE="$DATA_DIR/ghr-installer.db"
     mkdir -p "$DATA_DIR"
     
-    echo "Testing database operations..."
+    echo -e "\nTesting database operations..."
     
-    # Test adding a package
+    # Test 1: Adding a package
     add_to_db "test-pkg" "1.0.0" "/usr/local/bin/test" "/usr/local/share/man/man1/test.1"
-    echo "Added test package"
+    echo -e "\nTest 1: Adding package"
+    check_installation_status "test-pkg"
+    local status=$?
+    echo "Status code: $status (expect 3 - files missing)"
     
-    # Test getting package info
-    local info=$(get_package_info "test-pkg")
-    echo "Package info: $info"
+    # Test 2: Non-existent package
+    echo -e "\nTest 2: Checking non-existent package"
+    check_installation_status "nonexistent-pkg"
+    status=$?
+    echo "Status code: $status (expect 1 - not installed)"
     
-    # Test checking installation
-    if check_installed "test-pkg"; then
-        echo "Package check: OK"
-    else
-        echo "Package check: Failed"
-    fi
+    # Test 3: System-installed package
+    echo -e "\nTest 3: Checking system package"
+    check_installation_status "ls"
+    status=$?
+    echo "Status code: $status (expect 2 - installed but not managed)"
     
-    # Test getting version
-    local version=$(get_installed_version "test-pkg")
-    echo "Installed version: $version"
+    # Test 4: Package with missing files
+    echo -e "\nTest 4: Package with missing files"
+    # Create test binary
+    mkdir -p "$test_dir/bin"
+    touch "$test_dir/bin/test-pkg-2"
+    chmod +x "$test_dir/bin/test-pkg-2"
+    add_to_db "test-pkg-2" "1.0.0" "$test_dir/bin/test-pkg-2"
+    check_installation_status "test-pkg-2"
+    status=$?
+    echo "Status code: $status (expect 0 - properly installed)"
     
-    # Test removing package
-    remove_from_db "test-pkg"
-    echo "Removed package"
-    
-    # Verify removal
-    if ! check_installed "test-pkg"; then
-        echo "Package removal: OK"
-    else
-        echo "Package removal: Failed"
-    fi
+    # Remove the binary and check again
+    rm "$test_dir/bin/test-pkg-2"
+    check_installation_status "test-pkg-2"
+    status=$?
+    echo "Status code: $status (expect 3 - files missing)"
     
     # Clean up
     rm -rf "$test_dir"
