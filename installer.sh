@@ -13,12 +13,19 @@ declare -a arm64_patterns=(
     "arm[_-]64"
 )
 
-# Colors for output
-BOLD='\033[1m'
+# Global variables
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$HOME/.local/share/ghr-installer"
+DB_FILE="$DATA_DIR/packages.json"
+INSTALL_DIR="$HOME/.local/bin"
+repos_file="$SCRIPT_DIR/repos.txt"
+
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'  # No Color
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+NC='\033[0m'
 
 # Function to print with color
 print_color() {
@@ -28,202 +35,101 @@ print_color() {
 }
 
 # Configuration
-INSTALL_DIR="$HOME/.local/bin"
-DATA_DIR="$HOME/.local/ghr-installer"
-DB_FILE="$DATA_DIR/ghr-installer.db"
-repos_file="repos.txt"
 TEMP_DIR=$(mktemp -d)
 SHELLS=("/bin/bash" "/bin/zsh")
 
-# Function to lock database
-lock_db() {
-    local lock_file="$DATA_DIR/ghr-installer.lock"
-    local pid
-    
-    # Try to acquire lock
-    if [ -f "$lock_file" ]; then
-        pid=$(cat "$lock_file")
-        if kill -0 "$pid" 2>/dev/null; then
-            print_color "$RED" "Error: Another instance is running (PID: $pid)"
-            return 1
-        fi
-        # Stale lock file
-        rm -f "$lock_file"
+# Function to initialize database
+init_db() {
+    # Create database directory if it doesn't exist
+    local db_dir=$(dirname "$DB_FILE")
+    if [ ! -d "$db_dir" ]; then
+        mkdir -p "$db_dir"
     fi
     
-    echo $$ > "$lock_file"
-    return 0
-}
-
-# Function to unlock database
-unlock_db() {
-    rm -f "$DATA_DIR/ghr-installer.lock"
-}
-
-# Database operations wrapper
-db_ops() {
-    local operation=$1
-    shift
-
-    case "$operation" in
-        get)
-            local key=$1
-            if [ ! -f "$DB_FILE" ]; then
-                echo '{}'
-                return
-            fi
-            jq -r --arg key "$key" '.packages[$key] // empty' "$DB_FILE"
-            ;;
-        set)
-            local key=$1
-            local value=$2
-            mkdir -p "$(dirname "$DB_FILE")"
-            if [ ! -f "$DB_FILE" ]; then
-                echo '{"version":1,"packages":{}}' > "$DB_FILE"
-            fi
-            local temp_file="${DB_FILE}.tmp"
-            jq --arg key "$key" --argjson value "$value" '.packages[$key] = $value' "$DB_FILE" > "$temp_file"
-            mv "$temp_file" "$DB_FILE"
-            ;;
-        delete)
-            local key=$1
-            if [ -f "$DB_FILE" ]; then
-                local temp_file="${DB_FILE}.tmp"
-                jq --arg key "$key" 'del(.packages[$key])' "$DB_FILE" > "$temp_file"
-                mv "$temp_file" "$DB_FILE"
-            fi
-            ;;
-        list)
-            if [ ! -f "$DB_FILE" ]; then
-                return
-            fi
-            jq -r '.packages | keys[]' "$DB_FILE"
-            ;;
-        query)
-            local query=$1
-            if [ ! -f "$DB_FILE" ]; then
-                echo '{}'
-                return
-            fi
-            jq "$query" "$DB_FILE"
-            ;;
-    esac
-}
-
-# Function to read database
-read_db() {
+    # Create or validate database file
     if [ ! -f "$DB_FILE" ]; then
-        echo '{"version":1,"packages":{}}'
-        return
+        echo '{"packages":{}}' > "$DB_FILE"
+        chmod 600 "$DB_FILE"
+    else
+        # Validate JSON structure
+        if ! jq -e . "$DB_FILE" >/dev/null 2>&1; then
+            print_color "$RED" "Database file is corrupted. Reinitializing..."
+            echo '{"packages":{}}' > "$DB_FILE"
+            chmod 600 "$DB_FILE"
+        elif ! jq -e '.packages' "$DB_FILE" >/dev/null 2>&1; then
+            print_color "$RED" "Database file is missing required structure. Reinitializing..."
+            echo '{"packages":{}}' > "$DB_FILE"
+            chmod 600 "$DB_FILE"
+        fi
     fi
-    cat "$DB_FILE"
 }
 
-# Function to write database
-write_db() {
-    local content="$1"
-    if [ -n "$content" ]; then
-        echo "$content" > "$DB_FILE"
-    fi
-}
-
-# Function to add entry to database
+# Function to add package to database
 add_to_db() {
     local package=$1
     local version=$2
-    shift 2
-    local files=("$@")
+    local binary_path=$3
+    local current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     
-    if ! lock_db; then
+    # Create temporary file
+    local temp_file=$(mktemp)
+    
+    # Update or add package entry
+    jq --arg pkg "$package" \
+       --arg ver "$version" \
+       --arg path "$binary_path" \
+       --arg time "$current_time" \
+       '.packages[$pkg] = {
+           "version": $ver,
+           "binary_path": $path,
+           "installed_at": $time,
+           "updated_at": $time
+       }' "$DB_FILE" > "$temp_file"
+    
+    # Check if jq command succeeded
+    if [ $? -eq 0 ]; then
+        mv "$temp_file" "$DB_FILE"
+        chmod 600 "$DB_FILE"
+        return 0
+    else
+        rm -f "$temp_file"
         return 1
     fi
-    
-    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local entry=$(jq -n \
-        --arg ver "$version" \
-        --argjson files "$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)" \
-        --arg ts "$timestamp" \
-        '{version: $ver, files: $files, installed_at: $ts, updated_at: $ts}')
-    
-    db_ops set "$package" "$entry"
-    unlock_db
-}
-
-# Function to remove from database
-remove_from_db() {
-    local package=$1
-    
-    if ! lock_db; then
-        return 1
-    fi
-    
-    db_ops delete "$package"
-    unlock_db
 }
 
 # Function to get package info from database
 get_package_info() {
     local package=$1
-    db_ops get "$package"
-}
-
-# Function to check if a package is installed via ghr-installer
-check_installed() {
-    local package=$1
     if [ ! -f "$DB_FILE" ]; then
-        echo "Database file not found. No packages installed via ghr-installer."
+        return 1
+    fi
+    jq -r --arg pkg "$package" '.packages[$pkg]' "$DB_FILE" 2>/dev/null
+}
+
+# Function to remove package from database
+remove_from_db() {
+    local package=$1
+    
+    # Create lock file
+    local lock_file="$DB_FILE.lock"
+    if ! mkdir "$lock_file" 2>/dev/null; then
+        print_color "$RED" "Database is locked. Another process might be using it."
         return 1
     fi
     
-    check_installation_status "$package"
-    local status=$?
+    # Remove package from database
+    local temp_file=$(mktemp)
+    jq --arg pkg "$package" 'del(.packages[$pkg])' "$DB_FILE" > "$temp_file"
     
-    case $status in
-        0) return 0 ;;  # Properly installed
-        *) return 1 ;;  # Any other status is considered not installed
-    esac
-}
-
-# Function to get current installed version
-get_installed_version() {
-    local package=$1
-    local info=$(get_package_info "$package")
-    if [ -n "$info" ] && [ "$info" != "null" ]; then
-        echo "$info" | jq -r '.version'
-    fi
-}
-
-# Function to remove a package
-remove_package() {
-    local package=$1
-    if ! check_installed "$package"; then
+    if [ $? -eq 0 ] && [ -s "$temp_file" ]; then
+        mv "$temp_file" "$DB_FILE"
+        rm -rf "$lock_file"
+        return 0
+    else
+        print_color "$RED" "Failed to update database"
+        rm -f "$temp_file"
+        rm -rf "$lock_file"
         return 1
-    fi
-    
-    local info=$(get_package_info "$package")
-    local version=$(echo "$info" | jq -r '.version')
-    local files=$(echo "$info" | jq -r '.files[]')
-    
-    print_color "$BOLD" "Removing $package version $version..."
-    
-    # Remove all installed files
-    while IFS= read -r file; do
-        if [ -f "$file" ]; then
-            rm -f "$file"
-            echo "Removed: $file"
-        fi
-    done <<< "$files"
-    
-    # Remove from database
-    remove_from_db "$package"
-    
-    print_color "$GREEN" "Successfully removed $package"
-    
-    # Check for orphaned dependencies
-    echo -e "\n${BOLD}Checking for orphaned dependencies...${NC}"
-    if command -v apt >/dev/null 2>&1; then
-        echo "You can check for orphaned packages using:"
-        print_color "$YELLOW" "sudo apt autoremove"
     fi
 }
 
@@ -288,36 +194,46 @@ check_installation_status() {
     return 0  # Properly installed
 }
 
-# Initialize database
-init_db() {
-    mkdir -p "$DATA_DIR"
-    if [ ! -f "$DB_FILE" ]; then
-        echo '{"version":1,"packages":{}}' > "$DB_FILE"
-    else
-        # Check database version and migrate if needed
-        local version=$(jq -r '.version // 0' "$DB_FILE")
-        if [ "$version" = "0" ]; then
-            # Migrate old format to new format
-            local new_db='{"version":1,"packages":{}}'
-            while IFS='|' read -r pkg ver files || [ -n "$pkg" ]; do
-                [ -z "$pkg" ] && continue
-                local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-                local files_array=""
-                IFS=',' read -ra file_list <<< "$files"
-                for file in "${file_list[@]}"; do
-                    files_array="$files_array\"$file\","
-                done
-                files_array="[${files_array%,}]"
-                
-                local new_entry=$(jq -n \
-                    --arg ver "$ver" \
-                    --argjson files "$files_array" \
-                    --arg ts "$timestamp" \
-                    '{version: $ver, files: $files, installed_at: $ts, updated_at: $ts}')
-                new_db=$(echo "$new_db" | jq --arg pkg "$pkg" --argjson entry "$new_entry" '.packages[$pkg] = $entry')
-            done < "$DB_FILE"
-            write_db "$new_db"
+# Function to get current installed version
+get_installed_version() {
+    local package=$1
+    local info=$(get_package_info "$package")
+    if [ -n "$info" ] && [ "$info" != "null" ]; then
+        echo "$info" | jq -r '.version'
+    fi
+}
+
+# Function to remove a package
+remove_package() {
+    local package=$1
+    if ! check_installed "$package"; then
+        return 1
+    fi
+    
+    local info=$(get_package_info "$package")
+    local version=$(echo "$info" | jq -r '.version')
+    local files=$(echo "$info" | jq -r '.files[]')
+    
+    print_color "$BOLD" "Removing $package version $version..."
+    
+    # Remove all installed files
+    while IFS= read -r file; do
+        if [ -f "$file" ]; then
+            rm -f "$file"
+            echo "Removed: $file"
         fi
+    done <<< "$files"
+    
+    # Remove from database
+    remove_from_db "$package"
+    
+    print_color "$GREEN" "Successfully removed $package"
+    
+    # Check for orphaned dependencies
+    echo -e "\n${BOLD}Checking for orphaned dependencies...${NC}"
+    if command -v apt >/dev/null 2>&1; then
+        echo "You can check for orphaned packages using:"
+        print_color "$YELLOW" "sudo apt autoremove"
     fi
 }
 
@@ -368,113 +284,62 @@ check_script_dependencies() {
     fi
 }
 
-# Function to get latest GitHub release information
+# Function to get GitHub release information
 get_github_release() {
     local repo=$1
-    local api_url="https://api.github.com/repos/$repo/releases/latest"
     local response
-    local headers
     
-    # Create a temporary file for headers
-    local header_file=$(mktemp)
-    
-    # Try with GitHub token first if available
-    if [ -n "${GITHUB_TOKEN}" ]; then
-        response=$(curl -sL -D "$header_file" -H "Authorization: Bearer ${GITHUB_TOKEN}" "$api_url")
+    if [ -n "$GITHUB_TOKEN" ]; then
+        response=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
     else
-        response=$(curl -sL -D "$header_file" "$api_url")
+        response=$(curl -sL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
     fi
     
-    # Read rate limit information
-    local remaining=$(grep -i 'x-ratelimit-remaining:' "$header_file" | tr -dc '0-9')
-    if [ -n "$remaining" ] && [ "$remaining" -eq 0 ]; then
-        local reset_time=$(grep -i 'x-ratelimit-reset:' "$header_file" | tr -dc '0-9')
-        local current_time=$(date +%s)
-        local wait_time=$((reset_time - current_time))
-        print_color "$YELLOW" "GitHub API rate limit exceeded. Please wait $wait_time seconds or set GITHUB_TOKEN." >&2
-        rm -f "$header_file"
-        echo "{}"
-        return
-    fi
-    rm -f "$header_file"
-    
-    # Check if the response is valid JSON and not an error message
-    if echo "$response" | jq -e . >/dev/null 2>&1; then
-        if [ "$(echo "$response" | jq -r '.message')" = "Not Found" ]; then
-            print_color "$RED" "Repository $repo not found" >&2
-            echo "{}"
-        else
-            echo "$response"
+    # Check for rate limit
+    if echo "$response" | jq -e 'has("message")' > /dev/null 2>&1; then
+        local message=$(echo "$response" | jq -r '.message')
+        if [[ "$message" == *"rate limit"* ]]; then
+            print_color "$RED" "GitHub API rate limit exceeded. Please set GITHUB_TOKEN environment variable." >&2
+            return 1
+        elif [[ "$message" == *"Bad credentials"* ]]; then
+            print_color "$RED" "Invalid GitHub token. Please check your GITHUB_TOKEN." >&2
+            return 1
         fi
-    else
-        print_color "$RED" "Failed to get release info for $repo" >&2
-        echo "{}"
     fi
+    
+    # Check for valid JSON response
+    if ! echo "$response" | jq -e . > /dev/null 2>&1; then
+        print_color "$RED" "Invalid JSON response from GitHub API" >&2
+        return 1
+    fi
+    
+    echo "$response"
 }
 
-# Function to find appropriate binary asset
+# Function to find a suitable binary asset from release assets
 find_binary_asset() {
     local release=$1
     local package=$2
-    local arch=$(uname -m)
-    local patterns=()
-    local debug_output=""
     
-    # Select patterns based on architecture
-    case "$arch" in
-        x86_64|amd64)
-            patterns=("${x86_64_patterns[@]}")
-            ;;
-        aarch64|arm64)
-            patterns=("${arm64_patterns[@]}")
-            ;;
-        *)
-            print_color "$RED" "Unsupported architecture: $arch" >&2
-            return 1
-            ;;
-    esac
-    
-    # Store debug output
-    debug_output="Architecture: $arch\nAvailable assets for $package:\n"
-    debug_output+="$(echo "$release" | jq -r '.assets[].name' 2>/dev/null || echo "")\n"
-    
-    # First try exact package name match with architecture and linux
-    for pattern in "${patterns[@]}"; do
-        local asset_url=$(echo "$release" | jq -r --arg pattern "$pattern" \
-            '.assets[] | select(.name | test("linux.*(" + $pattern + ")") or test("(" + $pattern + ").*linux") or test("linux[_-]?64")) | select(.name | endswith(".tar.gz") or endswith(".tgz") or endswith(".zip")) | .browser_download_url' 2>/dev/null | head -n1)
-        if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-            local asset_name=$(echo "$release" | jq -r --arg url "$asset_url" \
-                '.assets[] | select(.browser_download_url == $url) | .name' 2>/dev/null)
-            echo "{\"name\": \"$asset_name\", \"url\": \"$asset_url\"}"
-            return 0
+    # Find suitable asset
+    local asset=""
+    while IFS= read -r a; do
+        local name=$(echo "$a" | jq -r '.name')
+        local url=$(echo "$a" | jq -r '.browser_download_url')
+        
+        # Skip invalid assets
+        [ "$name" = "null" ] && continue
+        [ "$url" = "null" ] && continue
+        
+        # Check if asset matches our architecture
+        if [[ "$name" =~ linux.*(x86_64|amd64) ]] && [[ "$name" =~ .*$package.* ]]; then
+            asset="$a"
+            break
         fi
-    done
+    done < <(echo "$release" | jq -c '.assets[]')
     
-    # Try just architecture match if linux match fails
-    for pattern in "${patterns[@]}"; do
-        local asset_url=$(echo "$release" | jq -r --arg pattern "$pattern" \
-            '.assets[] | select(.name | test($pattern)) | select(.name | endswith(".tar.gz") or endswith(".tgz") or endswith(".zip")) | .browser_download_url' 2>/dev/null | head -n1)
-        if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-            local asset_name=$(echo "$release" | jq -r --arg url "$asset_url" \
-                '.assets[] | select(.browser_download_url == $url) | .name' 2>/dev/null)
-            echo "{\"name\": \"$asset_name\", \"url\": \"$asset_url\"}"
-            return 0
-        fi
-    done
-    
-    # Try just the package name with common extensions
-    local asset_url=$(echo "$release" | jq -r --arg pkg "$package" \
-        '.assets[] | select(.name | test("^" + $pkg + "[-_.].*\\.(tar\\.gz|tgz|zip)$")) | .browser_download_url' 2>/dev/null | head -n1)
-    if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-        local asset_name=$(echo "$release" | jq -r --arg url "$asset_url" \
-            '.assets[] | select(.browser_download_url == $url) | .name' 2>/dev/null)
-        echo "{\"name\": \"$asset_name\", \"url\": \"$asset_url\"}"
-        return 0
-    fi
-    
-    # If we get here, no suitable asset was found, show debug info
-    print_color "$RED" "$debug_output" >&2
-    return 1
+    echo "$asset"
 }
 
 # Function to download and extract asset
@@ -573,446 +438,147 @@ install_apt_version() {
 # Function to install GitHub version
 install_github_version() {
     local package=$1
-    IFS='|' read -r apt_ver gh_ver status asset binary deps missing_deps completions <<< "${PACKAGE_INFO[$package]}"
+    local info="${PACKAGE_INFO[$package]}"
     
-    if [ ! -f "$binary" ]; then
-        print_color "$RED" "Binary not found for $package"
+    if [ -z "$info" ]; then
+        print_color "$RED" "No installation info found for $package"
         return 1
     fi
     
-    # Check dependencies if needed
-    if [ "$deps" = "Yes, needed" ]; then
-        print_color "$YELLOW" "Installing dependencies for $package..."
-        if ! sudo apt-get install -y $missing_deps; then
-            print_color "$RED" "Failed to install dependencies"
-            return 1
+    # Parse package info
+    IFS='|' read -r apt_version github_version status asset_url binary_path deps missing_deps completions <<< "$info"
+    
+    print_color "$GREEN" "Installing $package version $github_version..."
+    
+    # Create temp directory
+    local temp_dir=$(mktemp -d)
+    cd "$temp_dir" || exit
+    
+    # Download asset
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" "$asset_url" -o "$package.tar.gz" 2>/dev/null
+    else
+        curl -sL "$asset_url" -o "$package.tar.gz" 2>/dev/null
+    fi
+    
+    # Extract package
+    tar xf "$package.tar.gz" 2>/dev/null || true
+    
+    # Find binary
+    local binary=$(find . -type f -executable -name "$package" 2>/dev/null)
+    if [ -z "$binary" ]; then
+        # Try finding any executable that matches common binary patterns
+        while IFS= read -r file; do
+            if [[ "$file" =~ /bin/|/dist/|/target/|/build/ ]] || [[ "$file" =~ .*$package.* ]]; then
+                if ! [[ "$file" =~ \.sh$ ]] && ! [[ "$file" =~ /test/ ]]; then
+                    binary="$file"
+                    break
+                fi
+            fi
+        done < <(find . -type f -executable 2>/dev/null)
+        
+        # If still no binary found, try any executable
+        if [ -z "$binary" ]; then
+            binary=$(find . -type f -executable 2>/dev/null | head -n1)
         fi
     fi
     
-    # Install binary
-    mkdir -p "$INSTALL_DIR"
-    cp "$binary" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/$(basename "$binary")"
+    if [ -z "$binary" ]; then
+        print_color "$RED" "Binary not found for $package"
+        cd - > /dev/null || exit
+        rm -rf "$temp_dir"
+        return 1
+    fi
     
-    # Install completions and man pages
-    local installed_files=("$INSTALL_DIR/$(basename "$binary")")
-    if [ ! -z "$completions" ]; then
-        local comp_files=($(install_completions "$package" "$completions"))
-        installed_files+=("${comp_files[@]}")
+    print_color "$GREEN" "Found binary: $binary"
+    
+    # Create install directory
+    mkdir -p "$INSTALL_DIR"
+    
+    # Install binary
+    if ! cp "$binary" "$INSTALL_DIR/$package"; then
+        print_color "$RED" "Failed to install binary to $INSTALL_DIR"
+        cd - > /dev/null || exit
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    chmod +x "$INSTALL_DIR/$package"
+    
+    # Install completions if available
+    if [ -n "$completions" ]; then
+        print_color "$GREEN" "Installing completions..."
+        while IFS= read -r comp_file; do
+            [ -z "$comp_file" ] && continue
+            
+            local comp_name=$(basename "$comp_file")
+            case "$comp_file" in
+                *bash*)
+                    mkdir -p "$HOME/.local/share/bash-completion/completions"
+                    cp "$comp_file" "$HOME/.local/share/bash-completion/completions/$package"
+                    ;;
+                *zsh*)
+                    mkdir -p "$HOME/.local/share/zsh/site-functions"
+                    cp "$comp_file" "$HOME/.local/share/zsh/site-functions/_$package"
+                    ;;
+                *.1|*.1.gz)
+                    mkdir -p "$HOME/.local/share/man/man1"
+                    cp "$comp_file" "$HOME/.local/share/man/man1/"
+                    ;;
+            esac
+        done <<< "$completions"
     fi
     
     # Add to database
-    add_to_db "$package" "$gh_ver" "${installed_files[@]}"
+    add_to_db "$package" "$github_version" "$INSTALL_DIR/$package"
     
-    print_color "$GREEN" "Successfully installed $package $gh_ver"
+    print_color "$GREEN" "Successfully installed $package v$github_version"
     
-    # Setup PATH if needed
-    setup_path
-}
-
-# Function to install completions and man pages
-install_completions() {
-    local package=$1
-    local completions=$2
-    
-    if [ -z "$completions" ]; then
-        return 0
-    fi
-    
-    # Create completion directories if they don't exist
-    local bash_comp_dir="$HOME/.local/share/bash-completion/completions"
-    local zsh_comp_dir="$HOME/.local/share/zsh/site-functions"
-    local man_dir="$HOME/.local/share/man/man1"
-    
-    mkdir -p "$bash_comp_dir" "$zsh_comp_dir" "$man_dir"
-    
-    local installed_files=()
-    while IFS= read -r file; do
-        case "$file" in
-            *bash-completion*|*bash_completion*)
-                cp "$file" "$bash_comp_dir/$package"
-                installed_files+=("$bash_comp_dir/$package")
-                ;;
-            *zsh-completion*|*zsh_completion*)
-                cp "$file" "$zsh_comp_dir/_$package"
-                installed_files+=("$zsh_comp_dir/_$package")
-                ;;
-            *.1|*.1.gz)
-                cp "$file" "$man_dir/"
-                installed_files+=("$man_dir/$(basename "$file")")
-                ;;
-        esac
-    done <<< "$completions"
-    
-    echo "${installed_files[@]}"
-}
-
-# Function to setup PATH if needed
-setup_path() {
-    local shell_rc=""
-    case "$SHELL" in
-        */bash) shell_rc="$HOME/.bashrc" ;;
-        */zsh)  shell_rc="$HOME/.zshrc" ;;
-        *)      print_color "$RED" "Unsupported shell: $SHELL"; return 1 ;;
-    esac
-    
-    if ! grep -q "$INSTALL_DIR" "$shell_rc"; then
-        echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$shell_rc"
-        print_color "$GREEN" "Added $INSTALL_DIR to PATH in $shell_rc"
-    fi
-}
-
-# Function to process GitHub binary with version comparison
-process_github_binary() {
-    local repo=$1
-    local package=${repo#*/}
-    local release binary_path=""
-    local apt_version github_version status
-    local -A binary_info
-    local update_mode=${2:-""}
-    
-    # Get APT version
-    apt_version=$(get_apt_version "$package")
-    
-    # Get GitHub version
-    release=$(get_github_release "$repo")
-    if [ "$release" = "{}" ]; then
-        print_color "$RED" "Failed to get release info for $package" >&2
-        return 1
-    fi
-    github_version=$(echo "$release" | jq -r '.tag_name')
-    
-    # Compare versions
-    if [ "$apt_version" != "not found" ]; then
-        status=$(version_compare "$github_version" "$apt_version")
-        case $status in
-            "newer") status="GitHub";;
-            "older") status="APT";;
-            "equal") status="Equal";;
-        esac
-    else
-        status="GitHub only"
-    fi
-    
-    # If in update mode and not newer version available, skip
-    if [ "$update_mode" = "update" ] && [ "$status" != "GitHub" ]; then
-        print_color "$YELLOW" "No update available for $package" >&2
-        return 0
-    fi
-    
-    # Find appropriate binary asset
-    local asset=$(find_binary_asset "$release" "$package")
-    if [ -z "$asset" ] || [ "$asset" = "null" ]; then
-        print_color "$RED" "No suitable binary found for $package" >&2
-        return 1
-    fi
-    
-    # Parse asset JSON
-    local asset_name=$(echo "$asset" | jq -r '.name')
-    local asset_url=$(echo "$asset" | jq -r '.url')
-    
-    # If we got the browser_download_url, use that directly
-    if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-        # Process binary information
-        local package_dir="$TEMP_DIR/packages/$package"
-        mkdir -p "$package_dir"
-        
-        # Download and extract the asset
-        if ! download_and_extract "$asset_url" "$asset_name" "$package_dir"; then
-            print_color "$RED" "Failed to process asset for $package" >&2
-            return 1
-        fi
-        
-        # Find the binary
-        binary_path=$(find "$package_dir" -type f -executable -name "$package" 2>/dev/null)
-        
-        if [ -z "$binary_path" ]; then
-            # Try finding any executable
-            binary_path=$(find "$package_dir" -type f -executable 2>/dev/null | head -n1)
-        fi
-        
-        if [ -n "$binary_path" ]; then
-            # Check dependencies
-            local deps_status=$(check_dependencies "$binary_path")
-            case "$deps_status" in
-                "static")
-                    binary_info["dependencies"]="No, static"
-                    ;;
-                "satisfied")
-                    binary_info["dependencies"]="Yes, satisfied"
-                    ;;
-                *)
-                    binary_info["dependencies"]="Yes, needed"
-                    binary_info["missing_deps"]="$deps_status"
-                    ;;
-            esac
-            
-            # Look for completions and man pages
-            binary_info["completions"]=$(find "$package_dir" -type f \( -name "*completion*" -o -name "*man1*" -o -name "*.1" -o -name "*.1.gz" \) -print0 2>/dev/null | tr '\0' '\n')
-        else
-            print_color "$RED" "Could not find binary in extracted files for $package" >&2
-            return 1
-        fi
-    else
-        print_color "$RED" "Failed to get download URL for $package" >&2
-        return 1
-    fi
-    
-    # Create version comparison string with color
-    local gh_display_ver="${github_version#v}"
-    local version_info
-    if [ "$apt_version" != "not found" ] && [ "$status" = "GitHub" ]; then
-        version_info="$gh_display_ver*"
-    else
-        version_info="$gh_display_ver"
-    fi
-
-    # Clean up APT version display
-    local apt_display_ver
-    if [ "$apt_version" != "not found" ]; then
-        apt_display_ver=$(extract_version_numbers "$apt_version")
-    else
-        apt_display_ver="not found"
-    fi
-
-    # Truncate asset name if too long
-    local display_asset="${asset_name:0:40}"
-    if [ "${#asset_name}" -gt 40 ]; then
-        display_asset="${display_asset:0:37}..."
-    fi
-
-    # Print table row with fixed width columns
-    printf "%-15s %-12s %-12s %-15s %-40s\n" \
-        "$package" \
-        "$version_info" \
-        "$apt_display_ver" \
-        "${binary_info["dependencies"]:-Unknown}" \
-        "$display_asset"
-    
-    # Store information for installation
-    PACKAGE_INFO["$package"]="$apt_version|$github_version|$status|$asset_name|$binary_path|${binary_info["dependencies"]}|${binary_info["missing_deps"]}|${binary_info["completions"]}"
+    # Clean up
+    cd - > /dev/null || exit
+    rm -rf "$temp_dir"
+    return 0
 }
 
 # Function to load repositories
 load_repos() {
-    declare -g REPOS=()
-    # Check if repos.txt exists in the same directory as the script
-    if [ -f "$repos_file" ]; then
-        while IFS= read -r repo || [ -n "$repo" ]; do
-            # Skip empty lines and comments
-            [[ -z "$repo" || "$repo" =~ ^[[:space:]]*# ]] && continue
-            # Validate repo format
-            if [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-                REPOS+=("$repo")
-            else
-                print_color "$YELLOW" "Warning: Invalid repository format in repos.txt: $repo"
-            fi
-        done < "$repos_file"
-    else
-        print_color "$YELLOW" "No repos.txt found. Please enter repository URLs (format: owner/repo-name)"
-        print_color "$YELLOW" "Enter an empty line when done."
-        
-        while true; do
-            read -p "Repository (owner/repo-name): " repo
-            [[ -z "$repo" ]] && break
-            
-            if [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-                REPOS+=("$repo")
-            else
-                print_color "$YELLOW" "Invalid format. Please use format: owner/repo-name (e.g., junegunn/fzf)"
-            fi
-        done
+    if [ ! -f "$repos_file" ]; then
+        print_color "$RED" "Repository file $repos_file not found"
+        return 1
     fi
-
-    # Check if we have any repos to process
+    
+    # Read repositories into array, skipping comments and empty lines
+    REPOS=()
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+        
+        REPOS+=("$line")
+    done < "$repos_file"
+    
     if [ ${#REPOS[@]} -eq 0 ]; then
-        print_color "$RED" "No valid repositories found. Exiting."
-        exit 1
-    fi
-
-    print_color "$GREEN" "Processing repositories:"
-    printf '%s\n' "${REPOS[@]}"
-    echo
-}
-
-# Function to extract version numbers
-extract_version_numbers() {
-    local version=$1
-    # Remove 'v' prefix if present
-    version="${version#v}"
-    # Remove Ubuntu/Debian specific parts (e.g., -1ubuntu0.1)
-    version="${version%%-*}"
-    # Extract only numbers and dots, remove any other characters
-    version=$(echo "$version" | sed -E 's/[^0-9.]//g')
-    echo "$version"
-}
-
-# Function to compare version strings
-version_compare() {
-    local ver1=$(extract_version_numbers "$1")
-    local ver2=$(extract_version_numbers "$2")
-    
-    if [[ "$ver1" == "$ver2" ]]; then
-        echo "equal"
-        return
+        print_color "$RED" "No repositories found in $repos_file"
+        return 1
     fi
     
-    # Convert versions to arrays
-    local IFS=.
-    read -ra VER1 <<< "$ver1"
-    read -ra VER2 <<< "$ver2"
-    
-    # Get the maximum length
-    local max_length=$(( ${#VER1[@]} > ${#VER2[@]} ? ${#VER1[@]} : ${#VER2[@]} ))
-    
-    # Compare each component
-    for ((i=0; i<max_length; i++)); do
-        local v1=${VER1[$i]:-0}
-        local v2=${VER2[$i]:-0}
-        
-        if (( v1 > v2 )); then
-            echo "newer"
-            return
-        elif (( v1 < v2 )); then
-            echo "older"
-            return
-        fi
-    done
-    
-    # If we get here, versions are equal
-    echo "equal"
+    return 0
 }
 
-# Function to get APT package version
-get_apt_version() {
-    local package=$1
-    local version
-    
-    # Try to get version from both provided name and mapped name
-    version=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
-    
-    # Return "not found" if package isn't available or installed
-    if [ -z "$version" ]; then
-        echo "not found"
-    else
-        echo "$version"
-    fi
-}
-
-# Test database operations
-test_db_ops() {
-    local test_dir="/tmp/ghr-installer-test"
-    local old_data_dir="$DATA_DIR"
-    local old_db_file="$DB_FILE"
-    
-    # Set up test environment
-    DATA_DIR="$test_dir"
-    DB_FILE="$DATA_DIR/ghr-installer.db"
-    mkdir -p "$DATA_DIR"
-    
-    echo -e "\nTesting database operations..."
-    
-    # Test 1: Adding a package
-    add_to_db "test-pkg" "1.0.0" "/usr/local/bin/test" "/usr/local/share/man/man1/test.1"
-    echo -e "\nTest 1: Adding package"
-    check_installation_status "test-pkg"
-    local status=$?
-    echo "Status code: $status (expect 3 - files missing)"
-    
-    # Test 2: Non-existent package
-    echo -e "\nTest 2: Checking non-existent package"
-    check_installation_status "nonexistent-pkg"
-    status=$?
-    echo "Status code: $status (expect 1 - not installed)"
-    
-    # Test 3: System-installed package
-    echo -e "\nTest 3: Checking system package"
-    check_installation_status "ls"
-    status=$?
-    echo "Status code: $status (expect 2 - installed but not managed)"
-    
-    # Test 4: Package with missing files
-    echo -e "\nTest 4: Package with missing files"
-    # Create test binary
-    mkdir -p "$test_dir/bin"
-    touch "$test_dir/bin/test-pkg-2"
-    chmod +x "$test_dir/bin/test-pkg-2"
-    add_to_db "test-pkg-2" "1.0.0" "$test_dir/bin/test-pkg-2"
-    check_installation_status "test-pkg-2"
-    status=$?
-    echo "Status code: $status (expect 0 - properly installed)"
-    
-    # Remove the binary and check again
-    rm "$test_dir/bin/test-pkg-2"
-    check_installation_status "test-pkg-2"
-    status=$?
-    echo "Status code: $status (expect 3 - files missing)"
-    
-    # Clean up
-    rm -rf "$test_dir"
-    DATA_DIR="$old_data_dir"
-    DB_FILE="$old_db_file"
-}
-
-# Print usage information
-usage() {
-    print_color "$BOLD" "Usage: $0 [OPTIONS]"
-    echo
-    print_color "$BOLD" "Options:"
-    print_color "$BOLD" "  --update PACKAGE    Update specified package"
-    print_color "$BOLD" "  --remove PACKAGE    Remove specified package"
-    print_color "$BOLD" "  --help             Show this help message"
-    echo
-    print_color "$BOLD" "Without options, runs in interactive mode"
-}
-
-# Main function
-main() {
-    # Initialize database
-    init_db
-    
-    # Parse command line arguments
-    case "$1" in
-        --update|-u)
-            if [ -z "$2" ]; then
-                print_color "$RED" "Error: Package name required for update"
-                usage
-                exit 1
-            fi
-            # Find repo for package
-            local repo=$(grep -l "$2" "$repos_file" | xargs grep -l "/" | head -n1)
-            if [ -z "$repo" ]; then
-                print_color "$RED" "Package $2 not found in repos.txt"
-                exit 1
-            fi
-            process_github_binary "$repo" "update"
-            exit 0
-            ;;
-        --remove|-r)
-            if [ -z "$2" ]; then
-                print_color "$RED" "Error: Package name required for removal"
-                usage
-                exit 1
-            fi
-            remove_package "$2"
-            exit 0
-            ;;
-        --help|-h)
-            usage
-            exit 0
-            ;;
-        -*)
-            print_color "$RED" "Unknown option: $1"
-            usage
-            exit 1
-            ;;
-    esac
-    
+# Interactive mode function
+interactive_mode() {
     # Check script dependencies
     check_script_dependencies
     
     # Load repositories
-    load_repos
+    if ! load_repos; then
+        print_color "$RED" "Failed to load repositories"
+        return 1
+    fi
+    
+    print_color "$GREEN" "Available packages:"
+    printf '%s\n' "${REPOS[@]}"
+    echo
     
     # Initialize package info array
     declare -A PACKAGE_INFO
@@ -1023,6 +589,101 @@ main() {
     printf "${BOLD}%-15s %-12s %-12s %-15s %-40s${NC}\n" \
         "Binary" "Github" "APT" "Dependencies" "Asset"
     echo "------------------------------------------------------------------------------------------------"
+    
+    # Function to process GitHub binary with version comparison
+    process_github_binary() {
+        local repo=$1
+        local package=${repo#*/}
+        local release binary_path=""
+        local apt_version github_version status
+        local -A binary_info
+        local update_mode=${2:-""}
+        
+        # Get APT version
+        apt_version=$(get_apt_version "$package")
+        
+        # Get GitHub version
+        release=$(get_github_release "$repo")
+        if [ "$release" = "{}" ]; then
+            print_color "$RED" "Failed to get release info for $package" >&2
+            return 1
+        fi
+        github_version=$(echo "$release" | jq -r '.tag_name')
+        
+        # Compare versions
+        if [ "$apt_version" != "not found" ]; then
+            status=$(version_compare "$github_version" "$apt_version")
+            case $status in
+                "newer") status="GitHub";;
+                "older") status="APT";;
+                "equal") status="Equal";;
+            esac
+        else
+            status="GitHub only"
+        fi
+        
+        # If in update mode and not newer version available, skip
+        if [ "$update_mode" = "update" ] && [ "$status" != "GitHub" ]; then
+            print_color "$YELLOW" "No update available for $package" >&2
+            return 0
+        fi
+        
+        # Find suitable asset
+        local asset_name=""
+        local asset_url=""
+        while IFS= read -r asset; do
+            local name=$(echo "$asset" | jq -r '.name')
+            local url=$(echo "$asset" | jq -r '.browser_download_url')
+            
+            # Skip invalid assets
+            [ "$name" = "null" ] && continue
+            [ "$url" = "null" ] && continue
+            
+            # Check if asset matches our architecture
+            if [[ "$name" =~ linux.*(x86_64|amd64) ]] && [[ "$name" =~ .*$package.* ]]; then
+                asset_name="$name"
+                asset_url="$url"
+                break
+            fi
+        done < <(echo "$release" | jq -c '.assets[]')
+        
+        if [ -z "$asset_url" ]; then
+            # Try tarball URL as fallback
+            asset_url=$(echo "$release" | jq -r '.tarball_url')
+            if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
+                return 1
+            fi
+        fi
+        
+        # Format display strings
+        local apt_display_ver="${apt_version:-not found}"
+        local gh_display_ver="${github_version#v}"
+        local version_info
+        if [ "$apt_version" != "not found" ] && [ "$status" = "GitHub" ]; then
+            version_info="$gh_display_ver*"
+        else
+            version_info="$gh_display_ver"
+        fi
+        
+        # Format asset name for display
+        local display_asset
+        if [ ${#asset_name} -gt 35 ]; then
+            display_asset="${asset_name:0:32}..."
+        else
+            display_asset="$asset_name"
+        fi
+        
+        # Display package information
+        printf "%-14s %-12s %-12s %-15s %-40s\n" \
+            "$package" \
+            "$version_info" \
+            "$apt_display_ver" \
+            "${binary_info["dependencies"]}" \
+            "$display_asset"
+        
+        # Store information for installation
+        PACKAGE_INFO["$package"]="$apt_version|$github_version|$status|$asset_url|$binary_path|${binary_info["dependencies"]}|${binary_info["missing_deps"]}|${binary_info["completions"]}"
+    }
     
     # Process each repository
     for repo in "${REPOS[@]}"; do
@@ -1111,5 +772,489 @@ main() {
     rm -rf "$TEMP_DIR"
 }
 
+# Function to extract version numbers
+extract_version_numbers() {
+    local version=$1
+    # Remove 'v' prefix if present
+    version="${version#v}"
+    # Remove Ubuntu/Debian specific parts (e.g., -1ubuntu0.1)
+    version="${version%%-*}"
+    # Extract only numbers and dots, remove any other characters
+    version=$(echo "$version" | sed -E 's/[^0-9.]//g')
+    echo "$version"
+}
+
+# Function to compare version strings
+version_compare() {
+    local ver1=$1
+    local ver2=$2
+    
+    # Remove 'v' prefix if present
+    ver1=${ver1#v}
+    ver2=${ver2#v}
+    
+    if [[ "$ver1" == "$ver2" ]]; then
+        echo "equal"
+        return
+    fi
+    
+    # Convert versions to arrays
+    local IFS=.
+    read -ra VER1 <<< "$ver1"
+    read -ra VER2 <<< "$ver2"
+    
+    # Get the maximum length
+    local max_length=$(( ${#VER1[@]} > ${#VER2[@]} ? ${#VER1[@]} : ${#VER2[@]} ))
+    
+    # Compare each component
+    for ((i=0; i<max_length; i++)); do
+        local v1=${VER1[$i]:-0}
+        local v2=${VER2[$i]:-0}
+        
+        # Remove any non-numeric characters for comparison
+        v1=$(echo "$v1" | tr -dc '0-9')
+        v2=$(echo "$v2" | tr -dc '0-9')
+        
+        if (( v1 > v2 )); then
+            echo "newer"
+            return
+        elif (( v1 < v2 )); then
+            echo "older"
+            return
+        fi
+    done
+    
+    # If we get here, versions are equal
+    echo "equal"
+}
+
+# Function to get APT package version
+get_apt_version() {
+    local package=$1
+    local version
+    
+    # Try to get version from both provided name and mapped name
+    version=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
+    
+    # Return "not found" if package isn't available or installed
+    if [ -z "$version" ]; then
+        echo "not found"
+    else
+        echo "$version"
+    fi
+}
+
+# Function to find suitable asset
+find_suitable_asset() {
+    local release_info=$1
+    local package=$2
+    local arch=$3
+    local asset_url=""
+    
+    # First try to find an exact match for the architecture
+    while IFS= read -r asset; do
+        local name=$(echo "$asset" | jq -r '.name')
+        local url=$(echo "$asset" | jq -r '.browser_download_url')
+        
+        # Skip invalid assets
+        [ "$name" = "null" ] && continue
+        [ "$url" = "null" ] && continue
+        
+        # Check if asset matches our architecture
+        if [[ "$name" =~ linux.*(x86_64|amd64) ]] && [[ "$name" =~ .*$package.* ]]; then
+            asset_url="$url"
+            break
+        fi
+    done < <(echo "$release_info" | jq -c '.assets[]')
+    
+    # If no exact match found, try tarball URL
+    if [ -z "$asset_url" ]; then
+        asset_url=$(echo "$release_info" | jq -r '.tarball_url')
+        if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
+            return 1
+        fi
+    fi
+    
+    echo "$asset_url"
+    return 0
+}
+
+# Function to check a single package for updates
+check_single_package() {
+    local package=$1
+    local check_all_sources=$2
+    local current_version
+    local latest_version
+    local status="Up to date"
+    local update_available=0
+    
+    # Get current version
+    local info=$(get_package_info "$package")
+    if [ -z "$info" ] || [ "$info" = "null" ]; then
+        return 0
+    fi
+    
+    current_version=$(echo "$info" | jq -r '.version')
+    if [ -z "$current_version" ] || [ "$current_version" = "null" ]; then
+        return 0
+    fi
+    
+    # Remove 'v' prefix for version comparison
+    current_version=${current_version#v}
+    
+    # Check GitHub version if package is in repos.txt or check_all_sources is true
+    if [ "$check_all_sources" = "true" ] || grep -q "$package" "$repos_file" 2>/dev/null; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ .*"$package".* ]]; then
+                local release_info=$(get_github_release "$line" 2>/dev/null)
+                if [ $? -eq 0 ]; then
+                    latest_version=$(echo "$release_info" | jq -r '.tag_name')
+                    if [ -n "$latest_version" ] && [ "$latest_version" != "null" ]; then
+                        # Remove 'v' prefix for version comparison
+                        latest_version=${latest_version#v}
+                        if version_gt "$latest_version" "$current_version"; then
+                            status="v$latest_version available (GH)"
+                            update_available=1
+                        fi
+                    fi
+                fi
+                break
+            fi
+        done < "$repos_file"
+    fi
+    
+    # Format version with 'v' prefix for display
+    printf "%-14s %-14s %s\n" \
+        "$package" \
+        "v$current_version" \
+        "$status"
+    
+    return $update_available
+}
+
+# Function to list all installed packages
+list_installed() {
+    if [ ! -f "$DB_FILE" ]; then
+        print_color "$RED" "No packages installed via ghr-installer"
+        return 1
+    fi
+    
+    # Check if database is empty or invalid
+    if ! jq -e '.packages' "$DB_FILE" >/dev/null 2>&1; then
+        print_color "$YELLOW" "No packages installed yet"
+        return 0
+    fi
+    
+    # Get count of packages
+    local count=$(jq '.packages | length' "$DB_FILE")
+    if [ "$count" -eq 0 ]; then
+        print_color "$YELLOW" "No packages installed yet"
+        return 0
+    fi
+    
+    # Print header
+    echo -e "\nInstalled packages:"
+    print_color "$BOLD" "Package         Version         Migration"
+    echo "--------------------------------------------"
+    
+    # Get all packages and their info
+    while IFS= read -r pkg; do
+        [ -z "$pkg" ] && continue
+        
+        # Get package info
+        local version=$(jq -r --arg pkg "$pkg" '.packages[$pkg].version' "$DB_FILE")
+        [ "$version" = "null" ] && continue
+        
+        local migration=""
+        # Check if APT version is available
+        if command -v apt-cache >/dev/null 2>&1; then
+            local apt_version=$(apt-cache policy "$pkg" 2>/dev/null | grep Candidate | cut -d' ' -f4)
+            if [ -n "$apt_version" ] && [ "$apt_version" != "(none)" ]; then
+                migration="APT v$apt_version available"
+            fi
+        fi
+        
+        # Format and print package info
+        printf "%-14s %-14s %s\n" \
+            "$pkg" \
+            "$version" \
+            "$migration"
+    done < <(jq -r '.packages | keys[]' "$DB_FILE")
+    
+    echo
+}
+
+# Function to install available updates
+install_updates() {
+    local package
+    while IFS= read -r pkg; do
+        [ -z "$pkg" ] && continue
+        check_single_package "$pkg" "false"
+        if [ $? -eq 1 ]; then
+            install_github_version "$pkg"
+        fi
+    done < <(jq -r '.packages | keys[]' "$DB_FILE" 2>/dev/null)
+}
+
+# Function to check for updates and provide migration advice
+check_updates() {
+    local package=$1
+    local check_all_sources=$2
+    local current_version
+    local latest_version
+    local apt_version
+    local updates_available=false
+    declare -A package_updates
+    
+    if [ -z "$package" ]; then
+        # Check all installed packages
+        echo -e "\nChecking for updates:"
+        print_color "$BOLD" "Package         Version         Status"
+        echo "----------------------------------------"
+        
+        while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            check_single_package "$pkg" "$check_all_sources"
+            if [ $? -eq 1 ]; then
+                updates_available=true
+            fi
+        done < <(jq -r '.packages | keys[]' "$DB_FILE" 2>/dev/null)
+        
+        if [ "$updates_available" = true ]; then
+            echo -e "\nUpdates available. Install? [y/N] "
+            read -r response
+            if [[ "$response" =~ ^[Yy]$ ]]; then
+                install_updates
+            fi
+        else
+            echo -e "\nAll packages are up to date."
+        fi
+        return 0
+    else
+        # Single package update
+        echo -e "\nChecking for updates:"
+        print_color "$BOLD" "Package         Version         Status"
+        echo "----------------------------------------"
+        
+        check_single_package "$package" "$check_all_sources"
+        local update_available=$?
+        
+        if [ $update_available -eq 1 ]; then
+            echo -e "\nUpdates available for $package. Install? [y/N] "
+            read -r response
+            if [[ "$response" =~ ^[Yy]$ ]]; then
+                install_github_version "$package"
+            fi
+        else
+            echo -e "\nNo updates available."
+        fi
+    fi
+}
+
+# Print usage information
+usage() {
+    print_color "$BOLD" "Usage: $0 [OPTIONS]"
+    print_color "$BOLD" "Options:"
+    print_color "$BOLD" "  --update PACKAGE    Update specified package"
+    print_color "$BOLD" "  --remove PACKAGE    Remove specified package"
+    print_color "$BOLD" "  --check-updates     Check for updates"
+    print_color "$BOLD" "  --list             List installed packages"
+    print_color "$BOLD" "  --help             Show this help message"
+    echo
+    print_color "$BOLD" "Without options, runs in interactive mode"
+}
+
+# Main function
+main() {
+    # Initialize database
+    init_db
+    
+    # Initialize environment
+    check_script_dependencies
+    
+    # Parse command line arguments
+    case "$1" in
+        --update|-u)
+            shift
+            if [ "$1" = "--all-sources" ]; then
+                check_updates "" "true"
+            elif [ -n "$1" ]; then
+                check_updates "$1" "false"
+            else
+                check_updates "" "false"
+            fi
+            exit 0
+            ;;
+        --remove|-r)
+            if [ -z "$2" ]; then
+                print_color "$RED" "Error: Package name required for removal"
+                usage
+                exit 1
+            fi
+            shift
+            remove_package "$1"
+            exit 0
+            ;;
+        --list|-l)
+            list_installed
+            exit 0
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            interactive_mode
+            ;;
+    esac
+}
+
 # Execute main function with all arguments
 main "$@"
+
+# Function to check package version
+check_package_version() {
+    local package=$1
+    local repo=${package#*/}
+    local release binary_path=""
+    local apt_version github_version status
+    local -A binary_info
+    local update_mode=${2:-""}
+    
+    # Get APT version
+    apt_version=$(get_apt_version "$package")
+    
+    # Get GitHub version
+    release=$(get_github_release "$repo")
+    if [ "$release" = "{}" ]; then
+        print_color "$RED" "Failed to get release info for $package" >&2
+        return 1
+    fi
+    github_version=$(echo "$release" | jq -r '.tag_name')
+    
+    # Compare versions
+    if [ "$apt_version" != "not found" ]; then
+        status=$(version_compare "$github_version" "$apt_version")
+        case $status in
+            "newer") status="GitHub";;
+            "older") status="APT";;
+            "equal") status="Equal";;
+        esac
+    else
+        status="GitHub only"
+    fi
+    
+    # If in update mode and not newer version available, skip
+    if [ "$update_mode" = "update" ] && [ "$status" != "GitHub" ]; then
+        print_color "$YELLOW" "No update available for $package" >&2
+        return 0
+    fi
+    
+    # Find suitable asset
+    local asset=$(find_binary_asset "$release" "$package")
+    if [ -z "$asset" ] || [ "$asset" = "null" ]; then
+        # Try tarball URL as fallback
+        local asset_url=$(echo "$release" | jq -r '.tarball_url')
+        if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
+            return 1
+        fi
+    else
+        local asset_name=$(echo "$asset" | jq -r '.name')
+        local asset_url=$(echo "$asset" | jq -r '.browser_download_url')
+    fi
+    
+    # If we got the browser_download_url, use that directly
+    if [ -n "$asset_url" ]; then
+        # Process binary information
+        local temp_dir=$(mktemp -d)
+        cd "$temp_dir" || exit
+        
+        # Download and extract the asset
+        print_color "$GREEN" "Downloading $asset_url..."
+        if [ -n "$GITHUB_TOKEN" ]; then
+            curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" "$asset_url" -o "$package.tar.gz" 2>/dev/null
+        else
+            curl -sL "$asset_url" -o "$package.tar.gz" 2>/dev/null
+        fi
+        
+        tar xf "$package.tar.gz" 2>/dev/null || true
+        
+        # Find the binary
+        binary_path=$(find . -type f -executable -name "$package" 2>/dev/null)
+        
+        if [ -z "$binary_path" ]; then
+            # Try finding any executable
+            binary_path=$(find . -type f -executable 2>/dev/null | head -n1)
+        fi
+        
+        if [ -n "$binary_path" ]; then
+            # Check dependencies
+            local deps_status=$(check_dependencies "$binary_path")
+            case "$deps_status" in
+                "static")
+                    binary_info["dependencies"]="No, static"
+                    ;;
+                "satisfied")
+                    binary_info["dependencies"]="Yes, satisfied"
+                    ;;
+                *)
+                    binary_info["dependencies"]="Yes, needed"
+                    binary_info["missing_deps"]="$deps_status"
+                    ;;
+            esac
+            
+            # Look for completions and man pages
+            binary_info["completions"]=$(find . -type f \( -name "*completion*" -o -name "*man1*" -o -name "*.1" -o -name "*.1.gz" \) -print0 2>/dev/null | tr '\0' '\n')
+        else
+            print_color "$RED" "Could not find binary in extracted files for $package" >&2
+            cd - > /dev/null || exit
+            rm -rf "$temp_dir"
+            return 1
+        fi
+        
+        cd - > /dev/null || exit
+        rm -rf "$temp_dir"
+    else
+        print_color "$RED" "Failed to get download URL for $package" >&2
+        return 1
+    fi
+    
+    # Format display strings
+    local apt_display_ver="${apt_version:-not found}"
+    local gh_display_ver="${github_version#v}"
+    local version_info
+    if [ "$apt_version" != "not found" ] && [ "$status" = "GitHub" ]; then
+        version_info="$gh_display_ver*"
+    else
+        version_info="$gh_display_ver"
+    fi
+    
+    # Format asset name for display
+    local display_asset
+    if [ ${#asset_name} -gt 35 ]; then
+        display_asset="${asset_name:0:32}..."
+    else
+        display_asset="$asset_name"
+    fi
+    
+    # Display package information
+    printf "%-14s %-12s %-12s %-15s %-40s\n" \
+        "$package" \
+        "$version_info" \
+        "$apt_display_ver" \
+        "${binary_info["dependencies"]}" \
+        "$display_asset"
+    
+    # Store information for installation
+    PACKAGE_INFO["$package"]="$apt_version|$github_version|$status|$asset_url|$binary_path|${binary_info["dependencies"]}|${binary_info["missing_deps"]}|${binary_info["completions"]}"
+}
+
+# Function to check if version1 is greater than version2
+version_gt() {
+    local ver1=$1
+    local ver2=$2
+    local result=$(version_compare "$ver1" "$ver2")
+    [ "$result" = "newer" ]
+}
