@@ -35,11 +35,198 @@ repos_file="repos.txt"
 TEMP_DIR=$(mktemp -d)
 SHELLS=("/bin/bash" "/bin/zsh")
 
-# Initialize database if not exists
+# Function to lock database
+lock_db() {
+    local lock_file="$DATA_DIR/ghr-installer.lock"
+    local pid
+    
+    # Try to acquire lock
+    if [ -f "$lock_file" ]; then
+        pid=$(cat "$lock_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            print_color "$RED" "Error: Another instance is running (PID: $pid)"
+            return 1
+        fi
+        # Stale lock file
+        rm -f "$lock_file"
+    fi
+    
+    echo $$ > "$lock_file"
+    return 0
+}
+
+# Function to unlock database
+unlock_db() {
+    rm -f "$DATA_DIR/ghr-installer.lock"
+}
+
+# Function to read database
+read_db() {
+    if [ ! -f "$DB_FILE" ]; then
+        echo '{"version":1,"packages":{}}'
+        return
+    fi
+    cat "$DB_FILE"
+}
+
+# Function to write database
+write_db() {
+    local content="$1"
+    if [ -n "$content" ]; then
+        echo "$content" > "$DB_FILE"
+    fi
+}
+
+# Function to add entry to database
+add_to_db() {
+    local package=$1
+    local version=$2
+    shift 2
+    local files=("$@")
+    
+    if ! lock_db; then
+        return 1
+    fi
+    
+    # Read current database
+    local db_content=$(read_db)
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    # Create new entry with proper JSON escaping
+    local files_json="["
+    for ((i=0; i<${#files[@]}; i++)); do
+        files_json+="\"${files[i]}\""
+        if [ $i -lt $((${#files[@]}-1)) ]; then
+            files_json+=","
+        fi
+    done
+    files_json+="]"
+    
+    local new_entry="{\"version\":\"$version\",\"files\":$files_json,\"installed_at\":\"$timestamp\",\"updated_at\":\"$timestamp\"}"
+    
+    # Update database
+    db_content=$(echo "$db_content" | jq --arg pkg "$package" --argjson entry "$new_entry" '.packages[$pkg] = $entry')
+    
+    # Write back to database
+    write_db "$db_content"
+    unlock_db
+}
+
+# Function to remove from database
+remove_from_db() {
+    local package=$1
+    
+    if ! lock_db; then
+        return 1
+    fi
+    
+    # Read current database
+    local db_content=$(read_db)
+    
+    # Remove package
+    db_content=$(echo "$db_content" | jq --arg pkg "$package" 'del(.packages[$pkg])')
+    
+    # Write back to database
+    write_db "$db_content"
+    unlock_db
+}
+
+# Function to get package info from database
+get_package_info() {
+    local package=$1
+    local db_content=$(read_db)
+    echo "$db_content" | jq -r --arg pkg "$package" '.packages[$pkg] // empty'
+}
+
+# Function to check if a package is installed via ghr-installer
+check_installed() {
+    local package=$1
+    if [ ! -f "$DB_FILE" ]; then
+        echo "Database file not found. No packages installed via ghr-installer."
+        return 1
+    fi
+    
+    local info=$(get_package_info "$package")
+    if [ -z "$info" ] || [ "$info" = "null" ]; then
+        print_color "$YELLOW" "Package $package was not installed using ghr-installer"
+        return 1
+    fi
+    return 0
+}
+
+# Function to get current installed version
+get_installed_version() {
+    local package=$1
+    local info=$(get_package_info "$package")
+    if [ -n "$info" ] && [ "$info" != "null" ]; then
+        echo "$info" | jq -r '.version'
+    fi
+}
+
+# Function to remove a package
+remove_package() {
+    local package=$1
+    if ! check_installed "$package"; then
+        return 1
+    fi
+    
+    local info=$(get_package_info "$package")
+    local version=$(echo "$info" | jq -r '.version')
+    local files=$(echo "$info" | jq -r '.files[]')
+    
+    print_color "$BOLD" "Removing $package version $version..."
+    
+    # Remove all installed files
+    while IFS= read -r file; do
+        if [ -f "$file" ]; then
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done <<< "$files"
+    
+    # Remove from database
+    remove_from_db "$package"
+    
+    print_color "$GREEN" "Successfully removed $package"
+    
+    # Check for orphaned dependencies
+    echo -e "\n${BOLD}Checking for orphaned dependencies...${NC}"
+    if command -v apt >/dev/null 2>&1; then
+        echo "You can check for orphaned packages using:"
+        print_color "$YELLOW" "sudo apt autoremove"
+    fi
+}
+
+# Initialize database
 init_db() {
     mkdir -p "$DATA_DIR"
     if [ ! -f "$DB_FILE" ]; then
-        touch "$DB_FILE"
+        echo '{"version":1,"packages":{}}' > "$DB_FILE"
+    else
+        # Check database version and migrate if needed
+        local version=$(jq -r '.version // 0' "$DB_FILE")
+        if [ "$version" = "0" ]; then
+            # Migrate old format to new format
+            local new_db='{"version":1,"packages":{}}'
+            while IFS='|' read -r pkg ver files || [ -n "$pkg" ]; do
+                [ -z "$pkg" ] && continue
+                local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                local files_array=""
+                IFS=',' read -ra file_list <<< "$files"
+                for file in "${file_list[@]}"; do
+                    files_array="$files_array\"$file\","
+                done
+                files_array="[${files_array%,}]"
+                
+                local new_entry=$(jq -n \
+                    --arg ver "$ver" \
+                    --argjson files "$files_array" \
+                    --arg ts "$timestamp" \
+                    '{version: $ver, files: $files, installed_at: $ts, updated_at: $ts}')
+                new_db=$(echo "$new_db" | jq --arg pkg "$pkg" --argjson entry "$new_entry" '.packages[$pkg] = $entry')
+            done < "$DB_FILE"
+            write_db "$new_db"
+        fi
     fi
 }
 
@@ -384,20 +571,6 @@ setup_path() {
     fi
 }
 
-# Function to add entry to database
-add_to_db() {
-    local package=$1
-    local version=$2
-    shift 2
-    local files=("$@")
-    
-    # Remove old entry if exists
-    sed -i "/^$package|/d" "$DB_FILE"
-    
-    # Add new entry with comma-separated file list
-    echo "$package|$version|$(IFS=,; echo "${files[*]}")" >> "$DB_FILE"
-}
-
 # Function to process GitHub binary with version comparison
 process_github_binary() {
     local repo=$1
@@ -632,61 +805,6 @@ get_apt_version() {
         echo "not found"
     else
         echo "$version"
-    fi
-}
-
-# Function to check if a package is installed via ghr-installer
-check_installed() {
-    local package=$1
-    if [ ! -f "$DB_FILE" ]; then
-        echo "Database file not found. No packages installed via ghr-installer."
-        return 1
-    fi
-    
-    if ! grep -q "^$package|" "$DB_FILE"; then
-        print_color "$YELLOW" "Package $package was not installed using ghr-installer"
-        return 1
-    fi
-    return 0
-}
-
-# Function to get current installed version
-get_installed_version() {
-    local package=$1
-    grep "^$package|" "$DB_FILE" | cut -d'|' -f2
-}
-
-# Function to remove a package
-remove_package() {
-    local package=$1
-    if ! check_installed "$package"; then
-        return 1
-    fi
-    
-    local line=$(grep "^$package|" "$DB_FILE")
-    IFS='|' read -r _ version files <<< "$line"
-    
-    print_color "$BOLD" "Removing $package version $version..."
-    
-    # Remove all installed files
-    IFS=',' read -ra file_list <<< "$files"
-    for file in "${file_list[@]}"; do
-        if [ -f "$file" ]; then
-            rm -f "$file"
-            echo "Removed: $file"
-        fi
-    done
-    
-    # Remove from database
-    sed -i "/^$package|/d" "$DB_FILE"
-    
-    print_color "$GREEN" "Successfully removed $package"
-    
-    # Check for orphaned dependencies
-    echo -e "\n${BOLD}Checking for orphaned dependencies...${NC}"
-    if command -v apt >/dev/null 2>&1; then
-        echo "You can check for orphaned packages using:"
-        print_color "$YELLOW" "sudo apt autoremove"
     fi
 }
 
