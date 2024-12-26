@@ -288,15 +288,32 @@ check_script_dependencies() {
 get_github_release() {
     local repo=$1
     local response
+    local url="https://api.github.com/repos/$repo/releases/latest"
     
+    # Add user agent to avoid 403 errors
     if [ -n "$GITHUB_TOKEN" ]; then
-        response=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
+        response=$(curl -v -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "User-Agent: Cascade-Installer" \
+            "$url" 2>&1)
     else
-        response=$(curl -sL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
+        response=$(curl -v -sL \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "User-Agent: Cascade-Installer" \
+            "$url" 2>&1)
     fi
     
-    # Check for rate limit
+    # Print debug info
+    echo "DEBUG: Response for $repo:" >&2
+    echo "$response" >&2
+    
+    # Check for valid JSON response
+    if ! echo "$response" | jq -e . > /dev/null 2>&1; then
+        print_color "$RED" "Invalid JSON response from GitHub API for $repo" >&2
+        return 1
+    fi
+    
+    # Check for error messages
     if echo "$response" | jq -e 'has("message")' > /dev/null 2>&1; then
         local message=$(echo "$response" | jq -r '.message')
         if [[ "$message" == *"rate limit"* ]]; then
@@ -305,41 +322,59 @@ get_github_release() {
         elif [[ "$message" == *"Bad credentials"* ]]; then
             print_color "$RED" "Invalid GitHub token. Please check your GITHUB_TOKEN." >&2
             return 1
+        elif [[ "$message" == *"Not Found"* ]]; then
+            print_color "$RED" "Repository not found: $repo" >&2
+            return 1
+        else
+            print_color "$RED" "GitHub API error for $repo: $message" >&2
+            return 1
         fi
     fi
     
-    # Check for valid JSON response
-    if ! echo "$response" | jq -e . > /dev/null 2>&1; then
-        print_color "$RED" "Invalid JSON response from GitHub API" >&2
+    # Check if response has required fields
+    if ! echo "$response" | jq -e 'has("tag_name")' > /dev/null 2>&1; then
+        print_color "$RED" "No release version found for $repo" >&2
         return 1
     fi
     
     echo "$response"
 }
 
-# Function to find a suitable binary asset from release assets
+# Function to find binary asset from release info
 find_binary_asset() {
     local release=$1
     local package=$2
+    local assets_json
+    
+    # Get assets array
+    assets_json=$(echo "$release" | jq -c '.assets[]' 2>/dev/null)
+    if [ -z "$assets_json" ]; then
+        return 1
+    fi
     
     # Find suitable asset
-    local asset=""
-    while IFS= read -r a; do
-        local name=$(echo "$a" | jq -r '.name')
-        local url=$(echo "$a" | jq -r '.browser_download_url')
+    local found_asset=""
+    while IFS= read -r asset; do
+        local name=$(echo "$asset" | jq -r '.name')
+        local url=$(echo "$asset" | jq -r '.browser_download_url')
         
         # Skip invalid assets
         [ "$name" = "null" ] && continue
         [ "$url" = "null" ] && continue
         
+        # Skip non-x86_64 assets
+        [[ "$name" =~ aarch64|arm64|arm|powerpc|ppc ]] && continue
+        
         # Check if asset matches our architecture
-        if [[ "$name" =~ linux.*(x86_64|amd64) ]] && [[ "$name" =~ .*$package.* ]]; then
-            asset="$a"
+        if [[ "$name" =~ linux.*(x86_64|amd64|musl|gnu) ]] && \
+           [[ "$name" =~ \.(tar\.gz|tgz|gz)$ ]] && \
+           ! [[ "$name" =~ (sha256|md5|sig|asc|manifest|deb|rpm)$ ]]; then
+            found_asset="$asset"
             break
         fi
-    done < <(echo "$release" | jq -c '.assets[]')
+    done < <(echo "$assets_json")
     
-    echo "$asset"
+    echo "$found_asset"
 }
 
 # Function to download and extract asset
@@ -542,27 +577,35 @@ install_github_version() {
 
 # Function to load repositories
 load_repos() {
+    # Reset repos array
+    REPOS=()
+    
+    # Check if repos file exists
     if [ ! -f "$repos_file" ]; then
-        print_color "$RED" "Repository file $repos_file not found"
-        return 1
+        print_color "$RED" "Repos file not found: $repos_file"
+        exit 1
     fi
     
-    # Read repositories into array, skipping comments and empty lines
-    REPOS=()
-    while IFS= read -r line; do
+    # Read repos file line by line
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Remove carriage returns and trailing/leading whitespace
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        
         # Skip comments and empty lines
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$line" ]] && continue
         
+        # Add repo to array
         REPOS+=("$line")
     done < "$repos_file"
     
+    # Check if any repos were found
     if [ ${#REPOS[@]} -eq 0 ]; then
         print_color "$RED" "No repositories found in $repos_file"
-        return 1
+        exit 1
     fi
-    
-    return 0
 }
 
 # Interactive mode function
@@ -603,12 +646,16 @@ interactive_mode() {
         apt_version=$(get_apt_version "$package")
         
         # Get GitHub version
-        release=$(get_github_release "$repo")
-        if [ "$release" = "{}" ]; then
+        release=$(get_github_release "$repo" 2>/dev/null)
+        if [ -z "$release" ] || [ "$release" = "{}" ]; then
             print_color "$RED" "Failed to get release info for $package" >&2
             return 1
         fi
         github_version=$(echo "$release" | jq -r '.tag_name')
+        if [ -z "$github_version" ] || [ "$github_version" = "null" ]; then
+            print_color "$RED" "Failed to get version info for $package" >&2
+            return 1
+        fi
         
         # Compare versions
         if [ "$apt_version" != "not found" ]; then
@@ -628,31 +675,81 @@ interactive_mode() {
             return 0
         fi
         
-        # Find suitable asset
-        local asset_name=""
-        local asset_url=""
-        while IFS= read -r asset; do
-            local name=$(echo "$asset" | jq -r '.name')
-            local url=$(echo "$asset" | jq -r '.browser_download_url')
-            
-            # Skip invalid assets
-            [ "$name" = "null" ] && continue
-            [ "$url" = "null" ] && continue
-            
-            # Check if asset matches our architecture
-            if [[ "$name" =~ linux.*(x86_64|amd64) ]] && [[ "$name" =~ .*$package.* ]]; then
-                asset_name="$name"
-                asset_url="$url"
-                break
-            fi
-        done < <(echo "$release" | jq -c '.assets[]')
+        # Process binary information
+        local temp_dir=$(mktemp -d)
+        cd "$temp_dir" || exit
         
-        if [ -z "$asset_url" ]; then
+        # Find suitable asset
+        local asset=$(find_binary_asset "$release" "$package")
+        if [ -z "$asset" ] || [ "$asset" = "null" ]; then
             # Try tarball URL as fallback
-            asset_url=$(echo "$release" | jq -r '.tarball_url')
+            local asset_url=$(echo "$release" | jq -r '.tarball_url')
             if [ -z "$asset_url" ] || [ "$asset_url" = "null" ]; then
                 return 1
             fi
+        else
+            local asset_name=$(echo "$asset" | jq -r '.name')
+            local asset_url=$(echo "$asset" | jq -r '.browser_download_url')
+        fi
+        
+        # If we got the browser_download_url, use that directly
+        if [ -n "$asset_url" ]; then
+            # Download asset
+            if [ -n "$GITHUB_TOKEN" ]; then
+                curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" "$asset_url" -o "$package.tar.gz" 2>/dev/null
+            else
+                curl -sL "$asset_url" -o "$package.tar.gz" 2>/dev/null
+            fi
+            
+            tar xf "$package.tar.gz" 2>/dev/null || true
+            
+            # Find the binary
+            binary_path=$(find . -type f -executable -name "$package" 2>/dev/null)
+            
+            if [ -z "$binary_path" ]; then
+                # Try finding any executable that matches common binary patterns
+                while IFS= read -r file; do
+                    if [[ "$file" =~ /bin/|/dist/|/target/|/build/ ]] || [[ "$file" =~ .*$package.* ]]; then
+                        if ! [[ "$file" =~ \.sh$ ]] && ! [[ "$file" =~ /test/ ]]; then
+                            binary_path="$file"
+                            break
+                        fi
+                    fi
+                done < <(find . -type f -executable 2>/dev/null)
+                
+                # If still no binary found, try any executable
+                if [ -z "$binary_path" ]; then
+                    binary_path=$(find . -type f -executable 2>/dev/null | head -n1)
+                fi
+            fi
+            
+            if [ -z "$binary_path" ]; then
+                print_color "$RED" "Could not find binary in extracted files for $package" >&2
+                cd - > /dev/null || exit
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Check dependencies
+            local deps_status=$(check_dependencies "$binary_path")
+            case "$deps_status" in
+                "static")
+                    binary_info["dependencies"]="No, static"
+                    ;;
+                "satisfied")
+                    binary_info["dependencies"]="Yes, satisfied"
+                    ;;
+                *)
+                    binary_info["dependencies"]="Yes, needed"
+                    binary_info["missing_deps"]="$deps_status"
+                    ;;
+            esac
+            
+            # Look for completions and man pages
+            binary_info["completions"]=$(find . -type f \( -name "*completion*" -o -name "*man1*" -o -name "*.1" -o -name "*.1.gz" \) -print0 2>/dev/null | tr '\0' '\n')
+        else
+            print_color "$RED" "Failed to get download URL for $package" >&2
+            return 1
         fi
         
         # Format display strings
@@ -1171,8 +1268,7 @@ check_package_version() {
         local temp_dir=$(mktemp -d)
         cd "$temp_dir" || exit
         
-        # Download and extract the asset
-        print_color "$GREEN" "Downloading $asset_url..."
+        # Download asset
         if [ -n "$GITHUB_TOKEN" ]; then
             curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" "$asset_url" -o "$package.tar.gz" 2>/dev/null
         else
@@ -1185,37 +1281,46 @@ check_package_version() {
         binary_path=$(find . -type f -executable -name "$package" 2>/dev/null)
         
         if [ -z "$binary_path" ]; then
-            # Try finding any executable
-            binary_path=$(find . -type f -executable 2>/dev/null | head -n1)
+            # Try finding any executable that matches common binary patterns
+            while IFS= read -r file; do
+                if [[ "$file" =~ /bin/|/dist/|/target/|/build/ ]] || [[ "$file" =~ .*$package.* ]]; then
+                    if ! [[ "$file" =~ \.sh$ ]] && ! [[ "$file" =~ /test/ ]]; then
+                        binary_path="$file"
+                        break
+                    fi
+                fi
+            done < <(find . -type f -executable 2>/dev/null)
+            
+            # If still no binary found, try any executable
+            if [ -z "$binary_path" ]; then
+                binary_path=$(find . -type f -executable 2>/dev/null | head -n1)
+            fi
         fi
         
-        if [ -n "$binary_path" ]; then
-            # Check dependencies
-            local deps_status=$(check_dependencies "$binary_path")
-            case "$deps_status" in
-                "static")
-                    binary_info["dependencies"]="No, static"
-                    ;;
-                "satisfied")
-                    binary_info["dependencies"]="Yes, satisfied"
-                    ;;
-                *)
-                    binary_info["dependencies"]="Yes, needed"
-                    binary_info["missing_deps"]="$deps_status"
-                    ;;
-            esac
-            
-            # Look for completions and man pages
-            binary_info["completions"]=$(find . -type f \( -name "*completion*" -o -name "*man1*" -o -name "*.1" -o -name "*.1.gz" \) -print0 2>/dev/null | tr '\0' '\n')
-        else
+        if [ -z "$binary_path" ]; then
             print_color "$RED" "Could not find binary in extracted files for $package" >&2
             cd - > /dev/null || exit
             rm -rf "$temp_dir"
             return 1
         fi
         
-        cd - > /dev/null || exit
-        rm -rf "$temp_dir"
+        # Check dependencies
+        local deps_status=$(check_dependencies "$binary_path")
+        case "$deps_status" in
+            "static")
+                binary_info["dependencies"]="No, static"
+                ;;
+            "satisfied")
+                binary_info["dependencies"]="Yes, satisfied"
+                ;;
+            *)
+                binary_info["dependencies"]="Yes, needed"
+                binary_info["missing_deps"]="$deps_status"
+                ;;
+        esac
+        
+        # Look for completions and man pages
+        binary_info["completions"]=$(find . -type f \( -name "*completion*" -o -name "*man1*" -o -name "*.1" -o -name "*.1.gz" \) -print0 2>/dev/null | tr '\0' '\n')
     else
         print_color "$RED" "Failed to get download URL for $package" >&2
         return 1
