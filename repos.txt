@@ -4,3 +4,5 @@ zyedidia/micro
 ajeetdsouza/zoxide
 eza-community/eza
 sharkdp/fd
+sharkdp/bat
+tldr-pages/tldr-c-client | tldr
