@@ -29,8 +29,13 @@ print_color() {
 
 # Configuration
 INSTALL_DIR="$HOME/.local/bin"
-DATA_DIR="$HOME/.local/ghr-installer"
-DB_FILE="$DATA_DIR/ghr-installer.db"
+DATA_DIR="$HOME/.local/share/ghr-installer"
+DB_FILE="$DATA_DIR/packages.json"
+CACHE_DIR="$DATA_DIR"
+CACHE_FILE="$CACHE_DIR/api-cache.json"
+ASSETS_CACHE_DIR="$CACHE_DIR/assets"
+CACHE_TTL=3600  # 1 hour in seconds
+OVERRIDE_CACHE=0
 repos_file="repos.txt"
 TEMP_DIR=$(mktemp -d)
 SHELLS=("/bin/bash" "/bin/zsh")
@@ -292,7 +297,7 @@ check_installation_status() {
 init_db() {
     mkdir -p "$DATA_DIR"
     if [ ! -f "$DB_FILE" ]; then
-        echo '{"version":1,"packages":{}}' > "$DB_FILE"
+        echo '{"packages":{}}' > "$DB_FILE"
     else
         # Check database version and migrate if needed
         local version=$(jq -r '.version // 0' "$DB_FILE")
@@ -368,48 +373,104 @@ check_script_dependencies() {
     fi
 }
 
+# Function to initialize cache
+init_cache() {
+    if [ ! -f "$CACHE_FILE" ]; then
+        echo '{"cache_version":"1.0","repositories":{}}' > "$CACHE_FILE"
+    fi
+    mkdir -p "$ASSETS_CACHE_DIR"
+    
+    # Clean any orphaned cache entries (older than 30 days)
+    find "$ASSETS_CACHE_DIR" -type f -mtime +30 -delete 2>/dev/null
+}
+
+# Function to get cached release
+get_cached_release() {
+    local repo=$1
+    
+    # If override cache is set, skip cache
+    if [ "$OVERRIDE_CACHE" -eq 1 ]; then
+        return 1
+    fi
+    
+    local cache_data
+    local last_checked
+    local current_time
+    
+    # Check if cache exists and is readable
+    if [ ! -r "$CACHE_FILE" ]; then
+        return 1
+    fi
+    
+    # Try to get cached data
+    cache_data=$(jq -r --arg repo "$repo" '.repositories[$repo] // empty' "$CACHE_FILE")
+    if [ -z "$cache_data" ]; then
+        return 1
+    fi
+    
+    # Check if cache is still valid
+    last_checked=$(echo "$cache_data" | jq -r '.last_checked')
+    current_time=$(date -u +%s)
+    last_checked_ts=$(date -u -d "$last_checked" +%s 2>/dev/null)
+    
+    if [ $? -eq 0 ] && [ $((current_time - last_checked_ts)) -lt "$CACHE_TTL" ]; then
+        # Cache is valid, return the cached release
+        echo "$cache_data" | jq -r '.latest_release'
+        return 0
+    fi
+    
+    return 1
+}
+
+# Function to update cache
+update_cache() {
+    local repo=$1
+    local release=$2
+    local current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local temp_file=$(mktemp)
+    
+    # Update cache with new data
+    jq --arg repo "$repo" \
+       --arg time "$current_time" \
+       --argjson release "$release" \
+       '.repositories[$repo] = {
+           "last_checked": $time,
+           "latest_release": $release
+       }' "$CACHE_FILE" > "$temp_file"
+    
+    # Move temporary file to cache file
+    mv "$temp_file" "$CACHE_FILE"
+}
+
 # Function to get latest GitHub release information
 get_github_release() {
     local repo=$1
-    local api_url="https://api.github.com/repos/$repo/releases/latest"
     local response
-    local headers
     
-    # Create a temporary file for headers
-    local header_file=$(mktemp)
-    
-    # Try with GitHub token first if available
-    if [ -n "${GITHUB_TOKEN}" ]; then
-        response=$(curl -sL -D "$header_file" -H "Authorization: Bearer ${GITHUB_TOKEN}" "$api_url")
-    else
-        response=$(curl -sL -D "$header_file" "$api_url")
+    # Try to get from cache first
+    response=$(get_cached_release "$repo")
+    if [ $? -eq 0 ]; then
+        echo "$response"
+        return 0
     fi
     
-    # Read rate limit information
-    local remaining=$(grep -i 'x-ratelimit-remaining:' "$header_file" | tr -dc '0-9')
-    if [ -n "$remaining" ] && [ "$remaining" -eq 0 ]; then
-        local reset_time=$(grep -i 'x-ratelimit-reset:' "$header_file" | tr -dc '0-9')
-        local current_time=$(date +%s)
-        local wait_time=$((reset_time - current_time))
-        print_color "$YELLOW" "GitHub API rate limit exceeded. Please wait $wait_time seconds or set GITHUB_TOKEN." >&2
-        rm -f "$header_file"
-        echo "{}"
-        return
+    # If not in cache or expired, fetch from GitHub API
+    local auth_header=""
+    if [ -n "$GITHUB_TOKEN" ]; then
+        auth_header="Authorization: Bearer $GITHUB_TOKEN"
     fi
-    rm -f "$header_file"
     
-    # Check if the response is valid JSON and not an error message
-    if echo "$response" | jq -e . >/dev/null 2>&1; then
-        if [ "$(echo "$response" | jq -r '.message')" = "Not Found" ]; then
-            print_color "$RED" "Repository $repo not found" >&2
-            echo "{}"
-        else
-            echo "$response"
+    response=$(curl -s -H "$auth_header" \
+        "https://api.github.com/repos/$repo/releases/latest")
+    
+    # If successful, update cache
+    if [ $? -eq 0 ] && echo "$response" | jq -e . >/dev/null 2>&1; then
+        if [ -z "$(echo "$response" | jq -r '.message // empty')" ]; then
+            update_cache "$repo" "$response"
         fi
-    else
-        print_color "$RED" "Failed to get release info for $repo" >&2
-        echo "{}"
     fi
+    
+    echo "$response"
 }
 
 # Function to find appropriate binary asset
@@ -477,38 +538,106 @@ find_binary_asset() {
     return 1
 }
 
-# Function to download and extract asset
-download_and_extract() {
-    local asset_url=$1
+# Function to get cached asset
+get_cached_asset() {
+    local repo=$1
     local asset_name=$2
-    local package_dir=$3
+    local asset_url=$3
+    local repo_dir="$ASSETS_CACHE_DIR/${repo//\//_}"
+    local cached_path="$repo_dir/$asset_name"
     
-    # Use -L to follow redirects and get the direct download URL
-    if ! curl -sL "$asset_url" -o "$package_dir/$asset_name"; then
-        print_color "$RED" "Failed to download $asset_name" >&2
+    # If override cache is set or asset doesn't exist in cache, return empty
+    if [ "$OVERRIDE_CACHE" -eq 1 ] || [ ! -f "$cached_path" ]; then
         return 1
     fi
     
-    case "$asset_name" in
+    # Get cached metadata
+    local meta_file="${cached_path}.meta"
+    if [ -f "$meta_file" ]; then
+        local cached_url=$(cat "$meta_file")
+        # If URL matches, return cached path
+        if [ "$cached_url" = "$asset_url" ]; then
+            echo "$cached_path"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# Function to cache asset
+cache_asset() {
+    local repo=$1
+    local asset_name=$2
+    local asset_url=$3
+    local downloaded_file=$4
+    
+    local repo_dir="$ASSETS_CACHE_DIR/${repo//\//_}"
+    local cached_path="$repo_dir/$asset_name"
+    local meta_file="${cached_path}.meta"
+    
+    # Clean old cache entries before adding new one
+    clean_old_cache "$repo" "$cached_path"
+    
+    # Create repo directory if it doesn't exist
+    mkdir -p "$repo_dir"
+    
+    # Copy file to cache
+    cp "$downloaded_file" "$cached_path"
+    # Store URL in metadata file
+    echo "$asset_url" > "$meta_file"
+}
+
+# Function to clean old cache entries
+clean_old_cache() {
+    local repo=$1
+    local new_asset=$2
+    local repo_dir="$ASSETS_CACHE_DIR/${repo//\//_}"
+    
+    # Skip if repo directory doesn't exist
+    [ ! -d "$repo_dir" ] && return 0
+    
+    # Remove all files except the new asset and its metadata
+    find "$repo_dir" -type f ! -name "$(basename "$new_asset")" ! -name "$(basename "$new_asset").meta" -delete 2>/dev/null
+}
+
+# Function to download and extract asset
+download_and_extract() {
+    local url=$1
+    local filename=$2
+    local target_dir=$3
+    local repo=$4
+    
+    # Try to get from cache first
+    local cached_file
+    cached_file=$(get_cached_asset "$repo" "$filename" "$url")
+    local download_path
+    
+    if [ $? -eq 0 ] && [ -f "$cached_file" ]; then
+        print_color "$YELLOW" "Using cached asset: $filename"
+        download_path="$cached_file"
+    else
+        # Download if not in cache
+        download_path="$TEMP_DIR/$filename"
+        if ! curl -L -o "$download_path" "$url"; then
+            print_color "$RED" "Failed to download $filename"
+            return 1
+        fi
+        # Cache the downloaded file
+        cache_asset "$repo" "$filename" "$url" "$download_path"
+    fi
+    
+    # Extract based on file extension
+    case "$filename" in
         *.tar.gz|*.tgz)
-            if ! tar xf "$package_dir/$asset_name" -C "$package_dir"; then
-                print_color "$RED" "Failed to extract $asset_name" >&2
-                return 1
-            fi
+            tar xzf "$download_path" -C "$target_dir"
             ;;
         *.zip)
-            if ! command -v unzip >/dev/null 2>&1; then
-                print_color "$YELLOW" "Installing unzip..."
-                sudo apt-get update >/dev/null 2>&1
-                sudo apt-get install -y unzip >/dev/null 2>&1
-            fi
-            if ! unzip -q "$package_dir/$asset_name" -d "$package_dir"; then
-                print_color "$RED" "Failed to extract $asset_name" >&2
-                return 1
-            fi
+            unzip -q "$download_path" -d "$target_dir"
             ;;
         *)
-            chmod +x "$package_dir/$asset_name"
+            print_color "$RED" "Unsupported archive format: $filename"
+            return 1
             ;;
     esac
     
@@ -575,39 +704,33 @@ install_github_version() {
     local package=$1
     IFS='|' read -r apt_ver gh_ver status asset binary deps missing_deps completions <<< "${PACKAGE_INFO[$package]}"
     
-    if [ ! -f "$binary" ]; then
-        print_color "$RED" "Binary not found for $package"
+    # Skip if no binary path found
+    if [ -z "$binary_path" ]; then
+        print_color "$RED" "No binary found for $package"
         return 1
     fi
     
-    # Check dependencies if needed
-    if [ "$deps" = "Yes, needed" ]; then
-        print_color "$YELLOW" "Installing dependencies for $package..."
-        if ! sudo apt-get install -y $missing_deps; then
-            print_color "$RED" "Failed to install dependencies"
-            return 1
-        fi
-    fi
-    
-    # Install binary
+    # Create install directory if it doesn't exist
     mkdir -p "$INSTALL_DIR"
-    cp "$binary" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/$(basename "$binary")"
     
-    # Install completions and man pages
-    local installed_files=("$INSTALL_DIR/$(basename "$binary")")
-    if [ ! -z "$completions" ]; then
-        local comp_files=($(install_completions "$package" "$completions"))
-        installed_files+=("${comp_files[@]}")
+    # Copy binary to install directory
+    local install_path="$INSTALL_DIR/$package"
+    if cp "$binary_path" "$install_path"; then
+        chmod +x "$install_path"
+        print_color "$GREEN" "Successfully installed $package $gh_ver"
+        
+        # Record the installation
+        record_installation "$package" "$gh_ver" "$install_path"
+        
+        # Install completions if available
+        if [ -n "$completions" ]; then
+            install_completions "$package" "$completions"
+        fi
+        return 0
+    else
+        print_color "$RED" "Failed to install $package"
+        return 1
     fi
-    
-    # Add to database
-    add_to_db "$package" "$gh_ver" "${installed_files[@]}"
-    
-    print_color "$GREEN" "Successfully installed $package $gh_ver"
-    
-    # Setup PATH if needed
-    setup_path
 }
 
 # Function to install completions and man pages
@@ -718,7 +841,7 @@ process_github_binary() {
         mkdir -p "$package_dir"
         
         # Download and extract the asset
-        if ! download_and_extract "$asset_url" "$asset_name" "$package_dir"; then
+        if ! download_and_extract "$asset_url" "$asset_name" "$package_dir" "$repo"; then
             print_color "$RED" "Failed to process asset for $package" >&2
             return 1
         fi
@@ -927,6 +1050,37 @@ list_installed_packages() {
     done <<< "$packages"
 }
 
+# Function to record installed package
+record_installation() {
+    local package=$1
+    local version=$2
+    local binary_path=$3
+    local current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    # Create packages file if it doesn't exist
+    if [ ! -f "$DB_FILE" ]; then
+        echo '{"packages":{}}' > "$DB_FILE"
+    fi
+    
+    # Create temporary file
+    local temp_file=$(mktemp)
+    
+    # Update package information
+    jq --arg pkg "$package" \
+       --arg ver "$version" \
+       --arg path "$binary_path" \
+       --arg time "$current_time" \
+       '.packages[$pkg] = {
+           "version": $ver,
+           "binary_path": $path,
+           "installed_at": (if .packages[$pkg] then .packages[$pkg].installed_at else $time end),
+           "updated_at": $time
+       }' "$DB_FILE" > "$temp_file"
+    
+    # Move temporary file to packages file
+    mv "$temp_file" "$DB_FILE"
+}
+
 # Print usage information
 usage() {
     print_color "$BOLD" "Usage: $0 [OPTIONS]"
@@ -934,6 +1088,7 @@ usage() {
     print_color "$BOLD" "  --update PACKAGE    Update specified package"
     print_color "$BOLD" "  --remove PACKAGE    Remove specified package"
     print_color "$BOLD" "  --list             List installed packages"
+    print_color "$BOLD" "  --override-cache   Bypass cache and fetch fresh data"
     print_color "$BOLD" "  --help             Show this help message"
     echo
     print_color "$BOLD" "Without options, runs in interactive mode"
@@ -944,46 +1099,57 @@ main() {
     # Initialize database
     init_db
     
+    # Initialize cache
+    init_cache
+    
     # Parse command line arguments
-    case "$1" in
-        --update|-u)
-            if [ -z "$2" ]; then
-                print_color "$RED" "Error: Package name required for update"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --update|-u)
+                if [ -z "$2" ]; then
+                    print_color "$RED" "Error: Package name required for update"
+                    usage
+                    exit 1
+                fi
+                local repo=$(grep -l "$2" "$repos_file" | xargs grep -l "/" | head -n1)
+                if [ -z "$repo" ]; then
+                    print_color "$RED" "Package $2 not found in repos.txt"
+                    exit 1
+                fi
+                process_github_binary "$repo" "update"
+                shift 2
+                ;;
+            --remove|-r)
+                if [ -z "$2" ]; then
+                    print_color "$RED" "Error: Package name required for removal"
+                    usage
+                    exit 1
+                fi
+                remove_package "$2"
+                shift 2
+                ;;
+            --list|-l)
+                list_installed_packages
+                exit 0
+                ;;
+            --override-cache)
+                OVERRIDE_CACHE=1
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            -*)
+                print_color "$RED" "Unknown option: $1"
                 usage
                 exit 1
-            fi
-            # Find repo for package
-            local repo=$(grep -l "$2" "$repos_file" | xargs grep -l "/" | head -n1)
-            if [ -z "$repo" ]; then
-                print_color "$RED" "Package $2 not found in repos.txt"
-                exit 1
-            fi
-            process_github_binary "$repo" "update"
-            exit 0
-            ;;
-        --remove|-r)
-            if [ -z "$2" ]; then
-                print_color "$RED" "Error: Package name required for removal"
-                usage
-                exit 1
-            fi
-            remove_package "$2"
-            exit 0
-            ;;
-        --list|-l)
-            list_installed_packages
-            exit 0
-            ;;
-        --help|-h)
-            usage
-            exit 0
-            ;;
-        -*)
-            print_color "$RED" "Unknown option: $1"
-            usage
-            exit 1
-            ;;
-    esac
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
     
     # Check script dependencies
     check_script_dependencies
