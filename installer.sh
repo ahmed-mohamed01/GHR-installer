@@ -614,17 +614,20 @@ download_and_extract() {
     local download_path
     
     if [ $? -eq 0 ] && [ -f "$cached_file" ]; then
-        print_color "$YELLOW" "Using cached asset: $filename"
         download_path="$cached_file"
+        # Set global variable to indicate cache was used
+        USED_CACHE=1
     else
         # Download if not in cache
+        print_color "$YELLOW" "Downloading $filename..."
         download_path="$TEMP_DIR/$filename"
-        if ! curl -L -o "$download_path" "$url"; then
+        if ! curl -sL --progress-bar -o "$download_path" "$url"; then
             print_color "$RED" "Failed to download $filename"
             return 1
         fi
         # Cache the downloaded file
         cache_asset "$repo" "$filename" "$url" "$download_path"
+        USED_CACHE=0
     fi
     
     # Extract based on file extension
@@ -702,35 +705,43 @@ install_apt_version() {
 # Function to install GitHub version
 install_github_version() {
     local package=$1
-    IFS='|' read -r apt_ver gh_ver status asset binary deps missing_deps completions <<< "${PACKAGE_INFO[$package]}"
+    local info="${PACKAGE_INFO[$package]}"
+    local IFS='|'
+    local fields=($info)
+    local binary_path="${fields[4]}"
+    local github_version="${fields[1]}"
+    local target_dir="$HOME/.local/bin"
     
-    # Skip if no binary path found
-    if [ -z "$binary_path" ]; then
-        print_color "$RED" "No binary found for $package"
+    if [ ! -f "$binary_path" ]; then
+        print_color "$RED" "Error: Binary file not found at $binary_path"
         return 1
     fi
     
-    # Create install directory if it doesn't exist
-    mkdir -p "$INSTALL_DIR"
+    # Create target directory if it doesn't exist
+    mkdir -p "$target_dir"
     
-    # Copy binary to install directory
-    local install_path="$INSTALL_DIR/$package"
-    if cp "$binary_path" "$install_path"; then
-        chmod +x "$install_path"
-        print_color "$GREEN" "Successfully installed $package $gh_ver"
-        
-        # Record the installation
-        record_installation "$package" "$gh_ver" "$install_path"
-        
-        # Install completions if available
-        if [ -n "$completions" ]; then
-            install_completions "$package" "$completions"
-        fi
-        return 0
-    else
+    # Install binary
+    print_color "$GREEN" "Installing $package to $target_dir..."
+    local target_path="$target_dir/$package"
+    if ! cp "$binary_path" "$target_path"; then
         print_color "$RED" "Failed to install $package"
         return 1
     fi
+    
+    # Make binary executable
+    chmod +x "$target_path"
+    
+    # Check if binary works
+    if ! "$target_path" --version >/dev/null 2>&1; then
+        print_color "$RED" "Warning: Installed binary may not work correctly"
+        return 1
+    fi
+    
+    # Record the installation
+    record_installation "$package" "$github_version" "$target_path"
+    
+    print_color "$GREEN" "Successfully installed $package"
+    return 0
 }
 
 # Function to install completions and man pages
@@ -841,16 +852,27 @@ process_github_binary() {
         mkdir -p "$package_dir"
         
         # Download and extract the asset
+        USED_CACHE=0
         if ! download_and_extract "$asset_url" "$asset_name" "$package_dir" "$repo"; then
             print_color "$RED" "Failed to process asset for $package" >&2
             return 1
         fi
         
-        # Find the binary
+        # Find the binary - first try exact name match
         binary_path=$(find "$package_dir" -type f -executable -name "$package" 2>/dev/null)
         
         if [ -z "$binary_path" ]; then
-            # Try finding any executable
+            # Try finding binary in common locations
+            for subdir in "" "bin/" "$package/" "${package}-"*"/"; do
+                if [ -x "$package_dir/$subdir$package" ]; then
+                    binary_path="$package_dir/$subdir$package"
+                    break
+                fi
+            done
+        fi
+        
+        if [ -z "$binary_path" ]; then
+            # Try finding any executable as last resort
             binary_path=$(find "$package_dir" -type f -executable 2>/dev/null | head -n1)
         fi
         
@@ -903,17 +925,32 @@ process_github_binary() {
     if [ "${#asset_name}" -gt 40 ]; then
         display_asset="${display_asset:0:37}..."
     fi
+    
+    # Add (cached) indicator if asset was from cache
+    if [ "$USED_CACHE" -eq 1 ]; then
+        display_asset="$display_asset (cached)"
+    fi
 
     # Print table row with fixed width columns
-    printf "%-15s %-12s %-12s %-15s %-40s\n" \
+    printf "%-15s %-12s %-12s %-40s\n" \
         "$package" \
         "$version_info" \
         "$apt_display_ver" \
-        "${binary_info["dependencies"]:-Unknown}" \
         "$display_asset"
     
     # Store information for installation
     PACKAGE_INFO["$package"]="$apt_version|$github_version|$status|$asset_name|$binary_path|${binary_info["dependencies"]}|${binary_info["missing_deps"]}|${binary_info["completions"]}"
+}
+
+# Function to print version table header
+print_version_table_header() {
+    echo "Checking versions..."
+    printf "%-15s %-12s %-12s %-40s\n" \
+        "Binary" \
+        "Github" \
+        "APT" \
+        "Asset"
+    echo "------------------------------------------------------------------------------------------------"
 }
 
 # Function to load repositories
@@ -1022,63 +1059,153 @@ get_apt_version() {
     fi
 }
 
-# Function to list installed packages
-list_installed_packages() {
-    local db_content
-    db_content=$(read_db)
+# Function to parse version from --version output
+parse_binary_version() {
+    local binary=$1
+    local version_output=$2
+    local version=""
     
-    print_color "$BOLD" "Packages managed by ghr-installer:"
-    printf "\n%-15s %-12s %-s\n" "Package" "Version" "Migration"
-    echo "----------------------------------------"
+    case "$(basename "$binary")" in
+        "bat")
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            ;;
+        "eza")
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            if [ -z "$version" ]; then
+                # Try getting version from binary directly
+                version=$("$binary" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            fi
+            ;;
+        "fd")
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            ;;
+        "fzf")
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            ;;
+        "micro")
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            ;;
+        "zoxide")
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            ;;
+        *)
+            # Generic version number extraction
+            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            ;;
+    esac
     
-    # Get all package names and filter out invalid entries
-    local packages
-    packages=$(echo "$db_content" | jq -r '.packages | keys[] | select(test("^[a-zA-Z0-9_-]+$"))' 2>/dev/null | sort)
-    
-    # Process each package
-    while IFS= read -r package; do
-        [ -z "$package" ] && continue
-        local version
-        version=$(echo "$db_content" | jq -r --arg pkg "$package" '.packages[$pkg].version' 2>/dev/null)
-        local apt_ver
-        apt_ver=$(get_apt_version "$package")
-        local migration_info=""
-        if [ "$apt_ver" != "not found" ]; then
-            migration_info="APT $apt_ver available"
-        fi
-        printf "%-15s %-12s %s\n" "$package" "$version" "$migration_info"
-    done <<< "$packages"
+    echo "${version:-Unknown}"
 }
 
-# Function to record installed package
+# Function to list installed packages
+list_installed_packages() {
+    local target_dir="$HOME/.local/bin"
+    local db_file="$DATA_DIR/installed.db"
+    
+    echo "Packages managed by ghr-installer:"
+    echo
+    printf "%-15s %-12s %-20s\n" "Package" "Version" "Location"
+    echo "-------------------------------------------------------"
+    
+    # Read each line from installed.db if it exists
+    if [ -f "$db_file" ]; then
+        while IFS='|' read -r package version path timestamp; do
+            if [ -f "$path" ]; then
+                # Try to get current version
+                local version_output=$("$path" --version 2>/dev/null | head -n1 || echo "Unknown")
+                local current_version=$(parse_binary_version "$path" "$version_output")
+                printf "%-15s %-12s %-20s\n" \
+                    "$package" \
+                    "$current_version" \
+                    "$path"
+            fi
+        done < "$db_file"
+    else
+        echo "No packages installed yet."
+    fi
+}
+
+# Function to record installation in database
 record_installation() {
     local package=$1
     local version=$2
-    local binary_path=$3
-    local current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local path=$3
+    local timestamp=$(date +%s)
+    local db_file="$DATA_DIR/installed.db"
+    local temp_file="$DATA_DIR/installed.db.tmp"
     
-    # Create packages file if it doesn't exist
-    if [ ! -f "$DB_FILE" ]; then
-        echo '{"packages":{}}' > "$DB_FILE"
+    # Create data directory if it doesn't exist
+    mkdir -p "$DATA_DIR"
+    
+    # Remove existing entry for this package
+    if [ -f "$db_file" ]; then
+        grep -v "^$package|" "$db_file" > "$temp_file" 2>/dev/null
     fi
     
-    # Create temporary file
-    local temp_file=$(mktemp)
+    # Add new entry
+    echo "$package|$version|$path|$timestamp" >> "$temp_file"
     
-    # Update package information
-    jq --arg pkg "$package" \
-       --arg ver "$version" \
-       --arg path "$binary_path" \
-       --arg time "$current_time" \
-       '.packages[$pkg] = {
-           "version": $ver,
-           "binary_path": $path,
-           "installed_at": (if .packages[$pkg] then .packages[$pkg].installed_at else $time end),
-           "updated_at": $time
-       }' "$DB_FILE" > "$temp_file"
+    # Replace original file
+    mv "$temp_file" "$db_file"
+}
+
+# Function to install selected packages
+install_selected_packages() {
+    local mode=$1
+    local install_count=0
+    local error_count=0
     
-    # Move temporary file to packages file
-    mv "$temp_file" "$DB_FILE"
+    for package in "${!PACKAGE_INFO[@]}"; do
+        local info="${PACKAGE_INFO[$package]}"
+        local IFS='|'
+        local fields=($info)
+        local apt_version="${fields[0]}"
+        local github_version="${fields[1]}"
+        local status="${fields[2]}"
+        
+        case "$mode" in
+            "newer")
+                if [ "$status" != "GitHub" ]; then
+                    continue
+                fi
+                ;;
+            "github")
+                # Always install GitHub version
+                ;;
+            "apt")
+                if [ "$apt_version" = "not found" ]; then
+                    continue
+                fi
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        
+        if [ "$mode" = "apt" ]; then
+            if ! sudo apt-get install -y "$package"; then
+                print_color "$RED" "Failed to install $package via APT"
+                ((error_count++))
+            else
+                ((install_count++))
+            fi
+        else
+            if install_github_version "$package"; then
+                ((install_count++))
+            else
+                ((error_count++))
+            fi
+        fi
+    done
+    
+    if [ $install_count -gt 0 ]; then
+        print_color "$GREEN" "\nSuccessfully installed $install_count package(s)"
+    fi
+    if [ $error_count -gt 0 ]; then
+        print_color "$RED" "Failed to install $error_count package(s)"
+    fi
+    
+    return $error_count
 }
 
 # Print usage information
@@ -1162,10 +1289,7 @@ main() {
     declare -A ALL_DEPENDENCIES
     
     # Print table header
-    print_color "$BOLD" "Checking versions..."
-    printf "${BOLD}%-15s %-12s %-12s %-15s %-40s${NC}\n" \
-        "Binary" "Github" "APT" "Dependencies" "Asset"
-    echo "------------------------------------------------------------------------------------------------"
+    print_version_table_header
     
     # Process each repository
     for repo in "${REPOS[@]}"; do
@@ -1203,27 +1327,13 @@ main() {
         1|2|3|4)
             case $choice in
                 1) # Install newer versions
-                    for package in "${!PACKAGE_INFO[@]}"; do
-                        IFS='|' read -r apt_ver gh_ver status asset path deps missing_deps completions <<< "${PACKAGE_INFO[$package]}"
-                        if [[ "$status" == "GitHub" ]]; then
-                            install_github_version "$package"
-                        elif [[ "$status" == "APT" ]]; then
-                            install_apt_version "$package"
-                        fi
-                    done
+                    install_selected_packages "newer"
                     ;;
                 2) # Install all GitHub versions
-                    for package in "${!PACKAGE_INFO[@]}"; do
-                        install_github_version "$package"
-                    done
+                    install_selected_packages "github"
                     ;;
                 3) # Install all APT versions
-                    for package in "${!PACKAGE_INFO[@]}"; do
-                        IFS='|' read -r apt_ver gh_ver status asset path deps missing_deps completions <<< "${PACKAGE_INFO[$package]}"
-                        if [[ "$apt_ver" != "not found" ]]; then
-                            install_apt_version "$package"
-                        fi
-                    done
+                    install_selected_packages "apt"
                     ;;
                 4) # Choose individually
                     for package in "${!PACKAGE_INFO[@]}"; do
