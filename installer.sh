@@ -394,155 +394,135 @@ init_cache() {
 
 # Function to get cached release
 get_cached_release() {
-    local repo=$1
+    local cache_key="$1"
+    local cache_file="$CACHE_DIR/releases/$cache_key"
     
-    # If override cache is set, skip cache
-    if [ "$OVERRIDE_CACHE" -eq 1 ]; then
-        return 1
-    fi
-    
-    local cache_data
-    local last_checked
-    local current_time
-    
-    # Check if cache exists and is readable
-    if [ ! -r "$CACHE_FILE" ]; then
-        return 1
-    fi
-    
-    # Try to get cached data
-    cache_data=$(jq -r --arg repo "$repo" '.repositories[$repo] // empty' "$CACHE_FILE")
-    if [ -z "$cache_data" ]; then
-        return 1
-    fi
-    
-    # Check if cache is still valid
-    last_checked=$(echo "$cache_data" | jq -r '.last_checked')
-    current_time=$(date -u +%s)
-    last_checked_ts=$(date -u -d "$last_checked" +%s 2>/dev/null)
-    
-    if [ $? -eq 0 ] && [ $((current_time - last_checked_ts)) -lt "$CACHE_TTL" ]; then
-        # Cache is valid, return the cached release
-        echo "$cache_data" | jq -r '.latest_release'
+    if [ -f "$cache_file" ]; then
+        cat "$cache_file"
         return 0
     fi
-    
     return 1
 }
 
 # Function to update cache
 update_cache() {
-    local repo=$1
-    local release=$2
-    local current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local temp_file=$(mktemp)
+    local cache_key="$1"
+    local version="$2"
+    local assets="$3"
+    local cache_file="$CACHE_DIR/releases/$cache_key"
     
-    # Update cache with new data
-    jq --arg repo "$repo" \
-       --arg time "$current_time" \
-       --argjson release "$release" \
-       '.repositories[$repo] = {
-           "last_checked": $time,
-           "latest_release": $release
-       }' "$CACHE_FILE" > "$temp_file"
+    # Create cache directory if it doesn't exist
+    mkdir -p "$(dirname "$cache_file")"
     
-    # Move temporary file to cache file
-    mv "$temp_file" "$CACHE_FILE"
+    # Write version to first line
+    echo "$version" > "$cache_file"
+    
+    # Write assets to subsequent lines
+    if [ -n "$assets" ]; then
+        echo "$assets" >> "$cache_file"
+    fi
 }
 
 # Function to get latest GitHub release information
 get_github_release() {
-    local repo=$1
-    local response
+    local repo="$1"
+    local cache_key="$repo"
+    local release_info
     
     # Try to get from cache first
-    response=$(get_cached_release "$repo")
-    if [ $? -eq 0 ]; then
-        echo "$response"
-        return 0
+    if [ "$OVERRIDE_CACHE" != "1" ]; then
+        release_info=$(get_cached_release "$cache_key")
+        if [ -n "$release_info" ]; then
+            echo "$release_info"
+            return
+        fi
     fi
     
-    # If not in cache or expired, fetch from GitHub API
-    local auth_header=""
+    # Prepare API URL
+    local api_url="https://api.github.com/repos/$repo/releases/latest"
+    api_url="${api_url%"${api_url##*[![:space:]]}"}"  # Remove trailing spaces
+    
+    # Prepare headers array
+    declare -a headers=()
     if [ -n "$GITHUB_TOKEN" ]; then
-        auth_header="Authorization: Bearer $GITHUB_TOKEN"
+        headers+=(-H "Authorization: Bearer $GITHUB_TOKEN")
     fi
     
-    # First check rate limit
-    local rate_limit_response=$(curl -s -I -H "$auth_header" \
-        "https://api.github.com/rate_limit")
+    # Make API request
+    local response
+    response=$(curl -sL ${headers[@]+"${headers[@]}"} "$api_url")
     
-    if echo "$rate_limit_response" | grep -q "^X-RateLimit-Remaining: 0"; then
-        print_color "$RED" "GitHub API rate limit exceeded. Please set GITHUB_TOKEN environment variable." >&2
-        return 1
+    # Check if response is valid JSON and contains tag_name
+    if ! echo "$response" | jq -e .tag_name > /dev/null 2>&1; then
+        # Return empty string to indicate no release found
+        echo ""
+        return
     fi
     
-    # Fetch release info
-    response=$(curl -s -H "$auth_header" \
-        "https://api.github.com/repos/$repo/releases/latest")
+    # Extract version and assets
+    local version=$(echo "$response" | jq -r .tag_name)
+    version="${version#v}"  # Remove leading 'v' if present
+    local assets=$(echo "$response" | jq -r '.assets[] | .name + "," + .browser_download_url' 2>/dev/null)
     
-    # Check for API errors
-    if [ -n "$(echo "$response" | jq -r '.message // empty')" ]; then
-        local error_msg=$(echo "$response" | jq -r '.message')
-        print_color "$RED" "GitHub API error: $error_msg" >&2
-        return 1
-    fi
+    # Cache the result
+    update_cache "$cache_key" "$version" "$assets"
     
-    # Validate response has required fields
-    if ! echo "$response" | jq -e '.assets' >/dev/null 2>&1; then
-        print_color "$RED" "Invalid response from GitHub API for $repo" >&2
-        return 1
-    fi
-    
-    # If successful, update cache
-    update_cache "$repo" "$response"
-    
-    echo "$response"
+    # Return the cached result
+    get_cached_release "$cache_key"
 }
 
 # Function to find appropriate binary asset
 find_binary_asset() {
-    local release=$1
-    local package=$2
-    local arch=$(uname -m)
-    local patterns=()
+    local release_info="$1"
+    local version=$(echo "$release_info" | head -n1)
+    local best_asset=""
+    local best_score=0
     
-    # Select patterns based on architecture
-    case "$arch" in
-        x86_64|amd64)
-            patterns=("${x86_64_patterns[@]}")
-            ;;
-        aarch64|arm64)
-            patterns=("${arm64_patterns[@]}")
-            ;;
-        *)
-            print_color "$RED" "Unsupported architecture: $arch" >&2
-            return 1
-            ;;
-    esac
+    # If no assets section, return empty
+    if [ "$(echo "$release_info" | wc -l)" -le 1 ]; then
+        return
+    fi
     
-    # Special handling for packages with simpler naming
-    case "$package" in
-        "tldr")
-            patterns=(".*linux.*")  # tldr uses simpler naming
-            ;;
-    esac
-    
-    # Find matching asset
-    local asset_name asset_url
-    for pattern in "${patterns[@]}"; do
-        # Get both name and URL in one jq call to ensure they match
-        local result=$(echo "$release" | jq -r --arg pattern "$pattern" \
-            '.assets[] | select(.name | test($pattern; "i")) | select(.name | test("\\.(tar\\.gz|tgz|zip)$"; "i")) | {name: .name, url: .browser_download_url} | tojson' 2>/dev/null | head -n1)
+    # Skip first line (version) and process each asset
+    while IFS=',' read -r name url; do
+        [ -z "$name" ] && continue
         
-        if [ -n "$result" ] && [ "$result" != "null" ]; then
-            echo "$result"
-            return 0
+        local score=0
+        local matched_pattern=""
+        
+        # Check for architecture match
+        for pattern in "${x86_64_patterns[@]}"; do
+            if [[ "$name" =~ $pattern ]]; then
+                score=$((score + 2))
+                matched_pattern="$pattern"
+                break
+            fi
+        done
+        
+        # Skip if no architecture match
+        [ $score -eq 0 ] && continue
+        
+        # Prefer certain formats
+        case "$name" in
+            *.tar.gz|*.tgz)
+                score=$((score + 2))
+                ;;
+            *.zip)
+                score=$((score + 1))
+                ;;
+        esac
+        
+        # Update best match if we found a better score
+        if [ $score -gt $best_score ]; then
+            best_score=$score
+            best_asset="$name,$url"
         fi
-    done
+    done < <(echo "$release_info" | tail -n +2)
     
-    print_color "$RED" "No suitable binary found for $package" >&2
-    return 1
+    # Return the best matching asset
+    if [ -n "$best_asset" ]; then
+        echo "$best_asset"
+    fi
 }
 
 # Function to get cached asset
@@ -609,7 +589,15 @@ download_and_extract() {
         *.zip)
             unzip -q "$target_dir/$filename" -d "$target_dir"
             ;;
+        *.gz)
+            gunzip -c "$target_dir/$filename" > "$target_dir/${filename%.gz}"
+            chmod +x "$target_dir/${filename%.gz}"
+            ;;
         *)
+            if [ -f "$target_dir/$filename" ]; then
+                chmod +x "$target_dir/$filename"
+                return 0
+            fi
             print_color "$RED" "Unsupported archive format: $filename" >&2
             return 1
             ;;
@@ -767,163 +755,173 @@ setup_path() {
     fi
 }
 
-# Function to process GitHub binary with version comparison
-process_github_binary() {
-    local repo=$1
-    local package="${REPO_ALIASES[$repo]}"
-    local release binary_path=""
-    local apt_version github_version status
-    local -A binary_info
-    local update_mode=${2:-""}
+# Function to verify binary name matches expectations
+verify_binary_name() {
+    local repo=$1          # Full repo path (e.g., tldr-pages/tldr-c-client)
+    local binary_path=$2   # Path to found binary
+    local alias=$3         # Specified alias if any (e.g., tldr)
     
-    # Get APT version
-    apt_version=$(get_apt_version "$package")
+    # Get actual binary name from path
+    local actual_binary=$(basename "$binary_path")
     
-    # Get GitHub version
-    release=$(get_github_release "$repo")
-    if [ "$release" = "{}" ]; then
-        print_color "$RED" "Failed to get release info for $package" >&2
-        return 1
-    fi
-    github_version=$(echo "$release" | jq -r '.tag_name')
+    # Get repo name (part after /)
+    local repo_name=${repo#*/}
     
-    # Compare versions
-    if [ "$apt_version" != "not found" ]; then
-        status=$(version_compare "$github_version" "$apt_version")
-        case $status in
-            "newer") status="GitHub";;
-            "older") status="APT";;
-            "equal") status="Equal";;
-        esac
-    else
-        status="GitHub only"
-    fi
-    
-    # If in update mode and not newer version available, skip
-    if [ "$update_mode" = "update" ] && [ "$status" != "GitHub" ]; then
-        print_color "$YELLOW" "No update available for $package" >&2
+    # If alias is specified (owner/repo | binary format)
+    if [ -n "$alias" ]; then
+        if [ "$actual_binary" != "$alias" ]; then
+            print_color "$YELLOW" "Warning: Specified binary name '$alias' does not match installed binary '$actual_binary'"
+            print_color "$YELLOW" "Please verify this is the correct binary"
+        fi
         return 0
     fi
     
-    # Find appropriate binary asset
-    local asset=$(find_binary_asset "$release" "$package")
-    if [ -z "$asset" ] || [ "$asset" = "null" ]; then
-        print_color "$RED" "No suitable binary found for $package" >&2
-        return 1
+    # No alias specified (owner/repo format)
+    if [ "$actual_binary" != "$repo_name" ]; then
+        print_color "$YELLOW" "Warning: Repository name '$repo_name' does not match installed binary '$actual_binary'"
+        print_color "$YELLOW" "Please verify this is the correct binary or specify explicitly in repos.txt as:"
+        print_color "$YELLOW" "$repo | $actual_binary"
     fi
     
-    # Parse asset JSON
-    local asset_name=$(echo "$asset" | jq -r '.name')
-    local asset_url=$(echo "$asset" | jq -r '.url')
+    return 0
+}
+
+# Function to process GitHub binary with version comparison
+process_github_binary() {
+    local repo="$1"
+    local mode="${2:-check}"  # Default mode is check
+    local alias="${REPO_ALIASES[$repo]}"
+    local binary_name="$alias"
     
-    # If we got the browser_download_url, use that directly
-    if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-        # Process binary information
-        local package_dir="$TEMP_DIR/packages/$package"
-        mkdir -p "$package_dir"
-        
-        # Download and extract the asset
-        USED_CACHE=0
-        if ! download_and_extract "$asset_url" "$asset_name" "$package_dir" "$repo"; then
-            print_color "$RED" "Failed to process asset for $package" >&2
-            return 1
-        fi
-        
-        # Find the binary - first try exact name match
-        binary_path=$(find "$package_dir" -type f -executable -name "$package" 2>/dev/null)
-        
-        if [ -z "$binary_path" ]; then
-            # Try finding binary in common locations
-            for subdir in "" "bin/" "$package/" "${package}-"*"/"; do
-                if [ -x "$package_dir/$subdir$package" ]; then
-                    binary_path="$package_dir/$subdir$package"
-                    break
-                fi
-            done
-        fi
-        
-        if [ -z "$binary_path" ]; then
-            # Try finding any executable as last resort
-            binary_path=$(find "$package_dir" -type f -executable 2>/dev/null | head -n1)
-        fi
-        
-        if [ -n "$binary_path" ]; then
-            # Check dependencies
-            local deps_status=$(check_dependencies "$binary_path")
-            case "$deps_status" in
-                "static")
-                    binary_info["dependencies"]="No, static"
-                    ;;
-                "satisfied")
-                    binary_info["dependencies"]="Yes, satisfied"
-                    ;;
-                *)
-                    binary_info["dependencies"]="Yes, needed"
-                    binary_info["missing_deps"]="$deps_status"
-                    ;;
-            esac
-            
-            # Look for completions and man pages
-            binary_info["completions"]=$(find "$package_dir" -type f \( -name "*completion*" -o -name "*man1*" -o -name "*.1" -o -name "*.1.gz" \) -print0 2>/dev/null | tr '\0' '\n')
+    # Special case for tldr which has different binary name
+    if [[ "$repo" == "tldr-pages/tldr-c-client" ]]; then
+        binary_name="tldr"
+    fi
+    
+    # Get GitHub release info
+    local github_info=$(get_github_release "$repo")
+    local github_version=""
+    local asset_info=""
+    local asset_name="-"  # Default to "-" for asset name
+    
+    if [ -n "$github_info" ]; then
+        github_version=$(echo "$github_info" | head -n1)
+        asset_info=$(find_binary_asset "$github_info")
+        if [ -n "$asset_info" ]; then
+            asset_name=$(echo "$asset_info" | cut -d',' -f1)
         else
-            print_color "$RED" "Could not find binary in extracted files for $package" >&2
-            return 1
+            # No binary assets found or empty release info, mark as source only
+            github_version="source"
         fi
     else
-        print_color "$RED" "Failed to get download URL for $package" >&2
-        return 1
+        # No GitHub release info at all
+        github_version="source"
     fi
     
-    # Create version comparison string with color
-    local gh_display_ver="${github_version#v}"
-    local version_info
-    if [ "$apt_version" != "not found" ] && [ "$status" = "GitHub" ]; then
-        version_info="$gh_display_ver*"
-    else
-        version_info="$gh_display_ver"
-    fi
-
-    # Clean up APT version display
-    local apt_display_ver
-    if [ "$apt_version" != "not found" ]; then
-        apt_display_ver=$(extract_version_numbers "$apt_version")
-    else
-        apt_display_ver="not found"
-    fi
-
-    # Truncate asset name if too long
-    local display_asset="${asset_name:0:40}"
-    if [ "${#asset_name}" -gt 40 ]; then
-        display_asset="${display_asset:0:37}..."
+    # Get APT version
+    local apt_version=$(get_apt_version "$binary_name")
+    local installed_version=$(get_installed_version "$binary_name")
+    local deps_needed="No"
+    local missing_deps=""
+    
+    # Check dependencies only if we have binary assets and not source-only
+    if [ "$mode" = "check" ] && [ -n "$github_version" ] && [ "$github_version" != "source" ] && [ -n "$asset_info" ]; then
+        deps_needed=$(check_dependencies "$repo" "$asset_info")
+        if [ "$deps_needed" = "Yes" ]; then
+            missing_deps=$(check_dependencies "$repo" "$asset_info" "list")
+        fi
     fi
     
-    # Add status indicator
-    if [ "$USED_CACHE" -eq 1 ]; then
-        display_asset="$display_asset (cached)"
-    else
-        display_asset="$display_asset (downloaded)"
+    # Format asset display name
+    local display_asset="$asset_name"
+    if [ "$github_version" = "source" ]; then
+        display_asset="-"
+    elif [ -n "$asset_name" ] && [ "$asset_name" != "-" ] && [ -f "$CACHE_DIR/assets/$asset_name" ]; then
+        display_asset="$asset_name (cached)"
     fi
-
-    # Print table row with fixed width columns
-    printf "%-15s %-12s %-12s %-40s\n" \
-        "$package" \
-        "$version_info" \
-        "$apt_display_ver" \
-        "$display_asset"
     
-    # Store information for installation
-    PACKAGE_INFO["$package"]="$apt_version|$github_version|$status|$asset_name|$binary_path|${binary_info["dependencies"]}|${binary_info["missing_deps"]}|${binary_info["completions"]}"
+    # Add to results array using a format that's easier to parse
+    RESULTS+=("binary_name=$binary_name github_version=$github_version apt_version=$apt_version asset=$display_asset dependencies=$deps_needed missing_deps=$missing_deps installed_version=$installed_version")
 }
 
 # Function to print version table header
 print_version_table_header() {
-    echo "Checking versions..."
+    printf "%-15s %-12s %-12s %-40s\n" "Binary" "Github" "APT" "Asset"
+    printf "%s\n" "------------------------------------------------------------------------------------------------"
+}
+
+# Function to print version table row
+print_version_table_row() {
+    local result="$1"
+    declare -A info
+    
+    # Parse result string into associative array
+    while IFS='=' read -r key value; do
+        # Remove leading/trailing spaces and quotes
+        key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        value=$(echo "$value" | sed -e "s/^['\"]*//" -e "s/['\"]$//")
+        info[$key]="$value"
+    done < <(echo "$result" | tr ' ' '\n')
+    
+    # Format GitHub version
+    if [ -n "${info[github_version]}" ]; then
+        if [ "${info[apt_version]}" != "not found" ] && [ "${info[github_version]}" != "source" ]; then
+            info[github_version]="${info[github_version]}*"
+        fi
+    fi
+    
+    # Format asset name
+    if [ -n "${info[asset]}" ] && [ "${info[asset]}" != "-" ]; then
+        if [ ${#info[asset]} -gt 37 ]; then
+            info[asset]="${info[asset]:0:34}..."
+        fi
+    fi
+    
+    # Ensure "not found" is displayed in full
+    if [ "${info[apt_version]}" = "not" ]; then
+        info[apt_version]="not found"
+    fi
+    
     printf "%-15s %-12s %-12s %-40s\n" \
-        "Binary" \
-        "Github" \
-        "APT" \
-        "Asset"
-    echo "------------------------------------------------------------------------------------------------"
+        "${info[binary_name]}" \
+        "${info[github_version]:-}" \
+        "${info[apt_version]}" \
+        "${info[asset]:-}"
+}
+
+# Function to process results and print table
+process_results() {
+    print_version_table_header
+    
+    # Print each result
+    for result in "${RESULTS[@]}"; do
+        print_version_table_row "$result"
+    done
+    
+    # Check for missing dependencies
+    local missing_deps=0
+    local deps_output=""
+    
+    for result in "${RESULTS[@]}"; do
+        local dependencies missing_deps_list
+        eval "$(echo "$result" | tr ' ' '\n' | while IFS='=' read -r key value; do
+            if [[ "$key" =~ ^(dependencies|missing_deps)$ ]]; then
+                echo "$key=${value//\'/}"
+            fi
+        done)"
+        
+        if [ "$dependencies" = "Yes" ]; then
+            deps_output+="$missing_deps_list\n"
+            missing_deps=1
+        fi
+    done
+    
+    echo -e "\nDependencies needed:"
+    if [ "$missing_deps" = "1" ]; then
+        echo -e "$deps_output"
+    else
+        echo "No additional dependencies required"
+    fi
 }
 
 # Function to load repositories
@@ -1009,18 +1007,22 @@ version_compare() {
 
 # Function to get APT package version
 get_apt_version() {
-    local package=$1
+    local package="$1"
     local version
     
-    # Try to get version from both provided name and mapped name
-    version=$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2}')
+    # Get version from apt-cache policy, preferring Candidate if not installed
+    version=$(apt-cache policy "$package" 2>/dev/null | awk '/Installed:/ {i=$2} /Candidate:/ {c=$2} END {print (i!="(none)")?i:c}')
     
-    # Return "not found" if package isn't available or installed
-    if [ -z "$version" ]; then
+    # Return "not found" if no version found
+    if [ -z "$version" ] || [ "$version" = "(none)" ]; then
         echo "not found"
-    else
-        echo "$version"
+        return
     fi
+    
+    # Strip Ubuntu-specific version parts (everything after the first hyphen)
+    version="${version%%-*}"
+    
+    echo "$version"
 }
 
 # Function to parse version from --version output
@@ -1123,7 +1125,7 @@ install_selected_packages() {
         local info="${PACKAGE_INFO[$package]}"
         local IFS='|'
         local fields=($info)
-        local apt_version="${fields[0]}"
+        local apt_ver="${fields[0]}"
         local github_version="${fields[1]}"
         local status="${fields[2]}"
         
@@ -1137,7 +1139,7 @@ install_selected_packages() {
                 # Always install GitHub version
                 ;;
             "apt")
-                if [ "$apt_version" = "not found" ]; then
+                if [ "$apt_ver" = "not found" ]; then
                     continue
                 fi
                 ;;
@@ -1270,42 +1272,24 @@ main() {
     # Load repositories
     load_repos
     
-    # Initialize package info array
-    declare -A PACKAGE_INFO
-    declare -A ALL_DEPENDENCIES
-    
-    # Print table header
-    print_version_table_header
+    # Initialize results array
+    declare -g RESULTS=()
     
     # Process each repository
     for repo in "${REPOS[@]}"; do
         process_github_binary "$repo"
     done
     
-    # Collect all needed dependencies
-    print_color "$BOLD" "\nDependencies needed:"
-    for package in "${!PACKAGE_INFO[@]}"; do
-        IFS='|' read -r _ _ _ _ _ deps missing_deps _ <<< "${PACKAGE_INFO[$package]}"
-        if [ "$deps" = "Yes, needed" ]; then
-            for dep in $missing_deps; do
-                ALL_DEPENDENCIES["$dep"]=1
-            done
-        fi
-    done
-    
-    if [ ${#ALL_DEPENDENCIES[@]} -gt 0 ]; then
-        printf "%s\n" "${!ALL_DEPENDENCIES[@]}"
-    else
-        print_color "$GREEN" "No additional dependencies required"
-    fi
+    # Process and print results
+    process_results
     
     # Print installation options
     print_color "$BOLD" "\nInstallation options:"
-    print_color "$BOLD" "1. Install all newer versions"
-    print_color "$BOLD" "2. Install all GitHub versions (to $INSTALL_DIR)"
-    print_color "$BOLD" "3. Install all APT versions"
-    print_color "$BOLD" "4. Choose individually"
-    print_color "$BOLD" "5. Cancel"
+    echo "1. Install all newer versions"
+    echo "2. Install all GitHub versions (to $INSTALL_DIR)"
+    echo "3. Install all APT versions"
+    echo "4. Choose individually"
+    echo "5. Cancel"
     
     read -p "Select installation method [1-5]: " choice
     
