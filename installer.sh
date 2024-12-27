@@ -2,15 +2,21 @@
 
 # Architecture patterns for binary matching
 declare -a x86_64_patterns=(
-    "x86[_-]64"
-    "amd64"
-    "linux64"
+    ".*linux.*x86[_-]64"
+    ".*linux.*amd64"
+    ".*linux.*64.*bit"
+    ".*linux.*64"
+    ".*x86[_-]64.*linux"
+    ".*amd64.*linux"
+    ".*linux.*"  # More generic fallback
 )
 
 declare -a arm64_patterns=(
-    "arm64"
-    "aarch64"
-    "arm[_-]64"
+    ".*linux.*aarch64"
+    ".*linux.*arm64"
+    ".*aarch64.*linux"
+    ".*arm64.*linux"
+    ".*linux.*"  # More generic fallback
 )
 
 # Colors for output
@@ -18,6 +24,7 @@ BOLD='\033[1m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'  # No Color
 
 # Function to print with color
@@ -36,9 +43,13 @@ CACHE_FILE="$CACHE_DIR/api-cache.json"
 ASSETS_CACHE_DIR="$CACHE_DIR/assets"
 CACHE_TTL=3600  # 1 hour in seconds
 OVERRIDE_CACHE=0
-repos_file="repos.txt"
+REPOS_FILE="repos.txt"
 TEMP_DIR=$(mktemp -d)
 SHELLS=("/bin/bash" "/bin/zsh")
+
+# Global variables
+declare -A PACKAGE_INFO
+declare -A REPO_ALIASES
 
 # Function to lock database
 lock_db() {
@@ -375,13 +386,10 @@ check_script_dependencies() {
 
 # Function to initialize cache
 init_cache() {
+    mkdir -p "$CACHE_DIR" "$ASSETS_CACHE_DIR"
     if [ ! -f "$CACHE_FILE" ]; then
-        echo '{"cache_version":"1.0","repositories":{}}' > "$CACHE_FILE"
+        echo "{}" > "$CACHE_FILE"
     fi
-    mkdir -p "$ASSETS_CACHE_DIR"
-    
-    # Clean any orphaned cache entries (older than 30 days)
-    find "$ASSETS_CACHE_DIR" -type f -mtime +30 -delete 2>/dev/null
 }
 
 # Function to get cached release
@@ -460,15 +468,34 @@ get_github_release() {
         auth_header="Authorization: Bearer $GITHUB_TOKEN"
     fi
     
+    # First check rate limit
+    local rate_limit_response=$(curl -s -I -H "$auth_header" \
+        "https://api.github.com/rate_limit")
+    
+    if echo "$rate_limit_response" | grep -q "^X-RateLimit-Remaining: 0"; then
+        print_color "$RED" "GitHub API rate limit exceeded. Please set GITHUB_TOKEN environment variable." >&2
+        return 1
+    fi
+    
+    # Fetch release info
     response=$(curl -s -H "$auth_header" \
         "https://api.github.com/repos/$repo/releases/latest")
     
-    # If successful, update cache
-    if [ $? -eq 0 ] && echo "$response" | jq -e . >/dev/null 2>&1; then
-        if [ -z "$(echo "$response" | jq -r '.message // empty')" ]; then
-            update_cache "$repo" "$response"
-        fi
+    # Check for API errors
+    if [ -n "$(echo "$response" | jq -r '.message // empty')" ]; then
+        local error_msg=$(echo "$response" | jq -r '.message')
+        print_color "$RED" "GitHub API error: $error_msg" >&2
+        return 1
     fi
+    
+    # Validate response has required fields
+    if ! echo "$response" | jq -e '.assets' >/dev/null 2>&1; then
+        print_color "$RED" "Invalid response from GitHub API for $repo" >&2
+        return 1
+    fi
+    
+    # If successful, update cache
+    update_cache "$repo" "$response"
     
     echo "$response"
 }
@@ -479,7 +506,6 @@ find_binary_asset() {
     local package=$2
     local arch=$(uname -m)
     local patterns=()
-    local debug_output=""
     
     # Select patterns based on architecture
     case "$arch" in
@@ -495,69 +521,44 @@ find_binary_asset() {
             ;;
     esac
     
-    # Store debug output
-    debug_output="Architecture: $arch\nAvailable assets for $package:\n"
-    debug_output+="$(echo "$release" | jq -r '.assets[].name' 2>/dev/null || echo "")\n"
+    # Special handling for packages with simpler naming
+    case "$package" in
+        "tldr")
+            patterns=(".*linux.*")  # tldr uses simpler naming
+            ;;
+    esac
     
-    # First try exact package name match with architecture and linux
+    # Find matching asset
+    local asset_name asset_url
     for pattern in "${patterns[@]}"; do
-        local asset_url=$(echo "$release" | jq -r --arg pattern "$pattern" \
-            '.assets[] | select(.name | test("linux.*(" + $pattern + ")") or test("(" + $pattern + ").*linux") or test("linux[_-]?64")) | select(.name | endswith(".tar.gz") or endswith(".tgz") or endswith(".zip")) | .browser_download_url' 2>/dev/null | head -n1)
-        if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-            local asset_name=$(echo "$release" | jq -r --arg url "$asset_url" \
-                '.assets[] | select(.browser_download_url == $url) | .name' 2>/dev/null)
-            echo "{\"name\": \"$asset_name\", \"url\": \"$asset_url\"}"
+        # Get both name and URL in one jq call to ensure they match
+        local result=$(echo "$release" | jq -r --arg pattern "$pattern" \
+            '.assets[] | select(.name | test($pattern; "i")) | select(.name | test("\\.(tar\\.gz|tgz|zip)$"; "i")) | {name: .name, url: .browser_download_url} | tojson' 2>/dev/null | head -n1)
+        
+        if [ -n "$result" ] && [ "$result" != "null" ]; then
+            echo "$result"
             return 0
         fi
     done
     
-    # Try just architecture match if linux match fails
-    for pattern in "${patterns[@]}"; do
-        local asset_url=$(echo "$release" | jq -r --arg pattern "$pattern" \
-            '.assets[] | select(.name | test($pattern)) | select(.name | endswith(".tar.gz") or endswith(".tgz") or endswith(".zip")) | .browser_download_url' 2>/dev/null | head -n1)
-        if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-            local asset_name=$(echo "$release" | jq -r --arg url "$asset_url" \
-                '.assets[] | select(.browser_download_url == $url) | .name' 2>/dev/null)
-            echo "{\"name\": \"$asset_name\", \"url\": \"$asset_url\"}"
-            return 0
-        fi
-    done
-    
-    # Try just the package name with common extensions
-    local asset_url=$(echo "$release" | jq -r --arg pkg "$package" \
-        '.assets[] | select(.name | test("^" + $pkg + "[-_.].*\\.(tar\\.gz|tgz|zip)$")) | .browser_download_url' 2>/dev/null | head -n1)
-    if [ -n "$asset_url" ] && [ "$asset_url" != "null" ]; then
-        local asset_name=$(echo "$release" | jq -r --arg url "$asset_url" \
-            '.assets[] | select(.browser_download_url == $url) | .name' 2>/dev/null)
-        echo "{\"name\": \"$asset_name\", \"url\": \"$asset_url\"}"
-        return 0
-    fi
-    
-    # If we get here, no suitable asset was found, show debug info
-    print_color "$RED" "$debug_output" >&2
+    print_color "$RED" "No suitable binary found for $package" >&2
     return 1
 }
 
 # Function to get cached asset
 get_cached_asset() {
     local repo=$1
-    local asset_name=$2
-    local asset_url=$3
-    local repo_dir="$ASSETS_CACHE_DIR/${repo//\//_}"
-    local cached_path="$repo_dir/$asset_name"
+    local filename=$2
+    local cache_path="$ASSETS_CACHE_DIR/${repo//\//_}_$filename"
     
-    # If override cache is set or asset doesn't exist in cache, return empty
-    if [ "$OVERRIDE_CACHE" -eq 1 ] || [ ! -f "$cached_path" ]; then
-        return 1
-    fi
-    
-    # Get cached metadata
-    local meta_file="${cached_path}.meta"
-    if [ -f "$meta_file" ]; then
-        local cached_url=$(cat "$meta_file")
-        # If URL matches, return cached path
-        if [ "$cached_url" = "$asset_url" ]; then
-            echo "$cached_path"
+    if [ -f "$cache_path" ]; then
+        # Check if cache is still valid
+        local mtime=$(stat -c %Y "$cache_path")
+        local now=$(date +%s)
+        local age=$((now - mtime))
+        
+        if [ $age -lt $CACHE_TTL ] && [ ! $OVERRIDE_CACHE -eq 1 ]; then
+            echo "$cache_path"
             return 0
         fi
     fi
@@ -568,37 +569,12 @@ get_cached_asset() {
 # Function to cache asset
 cache_asset() {
     local repo=$1
-    local asset_name=$2
-    local asset_url=$3
-    local downloaded_file=$4
+    local filename=$2
+    local filepath=$3
+    local cache_path="$ASSETS_CACHE_DIR/${repo//\//_}_$filename"
     
-    local repo_dir="$ASSETS_CACHE_DIR/${repo//\//_}"
-    local cached_path="$repo_dir/$asset_name"
-    local meta_file="${cached_path}.meta"
-    
-    # Clean old cache entries before adding new one
-    clean_old_cache "$repo" "$cached_path"
-    
-    # Create repo directory if it doesn't exist
-    mkdir -p "$repo_dir"
-    
-    # Copy file to cache
-    cp "$downloaded_file" "$cached_path"
-    # Store URL in metadata file
-    echo "$asset_url" > "$meta_file"
-}
-
-# Function to clean old cache entries
-clean_old_cache() {
-    local repo=$1
-    local new_asset=$2
-    local repo_dir="$ASSETS_CACHE_DIR/${repo//\//_}"
-    
-    # Skip if repo directory doesn't exist
-    [ ! -d "$repo_dir" ] && return 0
-    
-    # Remove all files except the new asset and its metadata
-    find "$repo_dir" -type f ! -name "$(basename "$new_asset")" ! -name "$(basename "$new_asset").meta" -delete 2>/dev/null
+    mkdir -p "$ASSETS_CACHE_DIR"
+    cp "$filepath" "$cache_path"
 }
 
 # Function to download and extract asset
@@ -607,39 +583,34 @@ download_and_extract() {
     local filename=$2
     local target_dir=$3
     local repo=$4
+    local cached_path
     
-    # Try to get from cache first
-    local cached_file
-    cached_file=$(get_cached_asset "$repo" "$filename" "$url")
-    local download_path
-    
-    if [ $? -eq 0 ] && [ -f "$cached_file" ]; then
-        download_path="$cached_file"
-        # Set global variable to indicate cache was used
+    # Check cache first
+    cached_path=$(get_cached_asset "$repo" "$filename")
+    if [ $? -eq 0 ] && [ -n "$cached_path" ] && [ -f "$cached_path" ]; then
+        cp "$cached_path" "$target_dir/$filename"
         USED_CACHE=1
     else
+        USED_CACHE=0
         # Download if not in cache
-        print_color "$YELLOW" "Downloading $filename..."
-        download_path="$TEMP_DIR/$filename"
-        if ! curl -sL --progress-bar -o "$download_path" "$url"; then
-            print_color "$RED" "Failed to download $filename"
+        if ! curl -sL -H "Accept: application/octet-stream" "$url" -o "$target_dir/$filename"; then
+            print_color "$RED" "Failed to download $filename" >&2
             return 1
         fi
-        # Cache the downloaded file
-        cache_asset "$repo" "$filename" "$url" "$download_path"
-        USED_CACHE=0
+        # Cache the downloaded asset
+        cache_asset "$repo" "$filename" "$target_dir/$filename"
     fi
     
     # Extract based on file extension
     case "$filename" in
         *.tar.gz|*.tgz)
-            tar xzf "$download_path" -C "$target_dir"
+            tar -xzf "$target_dir/$filename" -C "$target_dir"
             ;;
         *.zip)
-            unzip -q "$download_path" -d "$target_dir"
+            unzip -q "$target_dir/$filename" -d "$target_dir"
             ;;
         *)
-            print_color "$RED" "Unsupported archive format: $filename"
+            print_color "$RED" "Unsupported archive format: $filename" >&2
             return 1
             ;;
     esac
@@ -799,7 +770,7 @@ setup_path() {
 # Function to process GitHub binary with version comparison
 process_github_binary() {
     local repo=$1
-    local package=${repo#*/}
+    local package="${REPO_ALIASES[$repo]}"
     local release binary_path=""
     local apt_version github_version status
     local -A binary_info
@@ -926,9 +897,11 @@ process_github_binary() {
         display_asset="${display_asset:0:37}..."
     fi
     
-    # Add (cached) indicator if asset was from cache
+    # Add status indicator
     if [ "$USED_CACHE" -eq 1 ]; then
         display_asset="$display_asset (cached)"
+    else
+        display_asset="$display_asset (downloaded)"
     fi
 
     # Print table row with fixed width columns
@@ -956,42 +929,33 @@ print_version_table_header() {
 # Function to load repositories
 load_repos() {
     declare -g REPOS=()
-    # Check if repos.txt exists in the same directory as the script
-    if [ -f "$repos_file" ]; then
-        while IFS= read -r repo || [ -n "$repo" ]; do
-            # Skip empty lines and comments
-            [[ -z "$repo" || "$repo" =~ ^[[:space:]]*# ]] && continue
-            # Validate repo format
-            if [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-                REPOS+=("$repo")
-            else
-                print_color "$YELLOW" "Warning: Invalid repository format in repos.txt: $repo"
-            fi
-        done < "$repos_file"
-    else
-        print_color "$YELLOW" "No repos.txt found. Please enter repository URLs (format: owner/repo-name)"
-        print_color "$YELLOW" "Enter an empty line when done."
+    local repo alias
+    
+    # Create repos file if it doesn't exist
+    if [ ! -f "$REPOS_FILE" ]; then
+        mkdir -p "$(dirname "$REPOS_FILE")"
+        touch "$REPOS_FILE"
+    fi
+    
+    echo "Processing repositories:"
+    while IFS= read -r line; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
         
-        while true; do
-            read -p "Repository (owner/repo-name): " repo
-            [[ -z "$repo" ]] && break
-            
-            if [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-                REPOS+=("$repo")
-            else
-                print_color "$YELLOW" "Invalid format. Please use format: owner/repo-name (e.g., junegunn/fzf)"
-            fi
-        done
-    fi
-
-    # Check if we have any repos to process
-    if [ ${#REPOS[@]} -eq 0 ]; then
-        print_color "$RED" "No valid repositories found. Exiting."
-        exit 1
-    fi
-
-    print_color "$GREEN" "Processing repositories:"
-    printf '%s\n' "${REPOS[@]}"
+        if [[ "$line" =~ ^([^|]+)[[:space:]]*\|[[:space:]]*([^[:space:]]+)$ ]]; then
+            # Has explicit alias: "repo | alias"
+            repo="${BASH_REMATCH[1]}"
+            alias="${BASH_REMATCH[2]}"
+        else
+            # No alias: "owner/repo"
+            repo="$line"
+            alias="${line#*/}"  # Gets part after /
+        fi
+        
+        REPOS+=("$repo")
+        REPO_ALIASES["$repo"]="$alias"
+        echo "$repo"
+    done < "$REPOS_FILE"
     echo
 }
 
@@ -1208,6 +1172,16 @@ install_selected_packages() {
     return $error_count
 }
 
+# Function to clear cache
+clear_cache() {
+    print_color "$BLUE" "Purging cache..."
+    rm -rf "$CACHE_DIR"
+    mkdir -p "$CACHE_DIR" "$ASSETS_CACHE_DIR"
+    touch "$CACHE_DIR/api-cache.json"
+    print_color "$GREEN" "Cache purged!"
+    exit 0  # Exit after clearing cache
+}
+
 # Print usage information
 usage() {
     print_color "$BOLD" "Usage: $0 [OPTIONS]"
@@ -1215,10 +1189,18 @@ usage() {
     print_color "$BOLD" "  --update PACKAGE    Update specified package"
     print_color "$BOLD" "  --remove PACKAGE    Remove specified package"
     print_color "$BOLD" "  --list             List installed packages"
+    print_color "$BOLD" "  --clear-cache      Clear GitHub API and asset cache"
     print_color "$BOLD" "  --override-cache   Bypass cache and fetch fresh data"
     print_color "$BOLD" "  --help             Show this help message"
     echo
     print_color "$BOLD" "Without options, runs in interactive mode"
+}
+
+# Print system information at start
+print_system_info() {
+    local arch=$(uname -m)
+    echo "System Architecture: $arch"
+    echo
 }
 
 # Main function
@@ -1229,6 +1211,9 @@ main() {
     # Initialize cache
     init_cache
     
+    # Print system info once at start
+    print_system_info
+    
     # Parse command line arguments
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1238,7 +1223,7 @@ main() {
                     usage
                     exit 1
                 fi
-                local repo=$(grep -l "$2" "$repos_file" | xargs grep -l "/" | head -n1)
+                local repo=$(grep -l "$2" "$REPOS_FILE" | xargs grep -l "/" | head -n1)
                 if [ -z "$repo" ]; then
                     print_color "$RED" "Package $2 not found in repos.txt"
                     exit 1
@@ -1259,6 +1244,10 @@ main() {
                 list_installed_packages
                 exit 0
                 ;;
+            --clear-cache)
+                clear_cache
+                shift
+                ;;
             --override-cache)
                 OVERRIDE_CACHE=1
                 shift
@@ -1267,13 +1256,10 @@ main() {
                 usage
                 exit 0
                 ;;
-            -*)
+            *)
                 print_color "$RED" "Unknown option: $1"
                 usage
                 exit 1
-                ;;
-            *)
-                break
                 ;;
         esac
     done
