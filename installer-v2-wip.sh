@@ -691,6 +691,7 @@ install_github_version() {
     local fields=($info)
     local binary_path="${fields[4]}"
     local github_version="${fields[1]}"
+    local completions="${fields[7]}"  # Get completions info
     local target_dir="$INSTALL_DIR"
     
     if [ ! -f "$binary_path" ]; then
@@ -718,8 +719,18 @@ install_github_version() {
         return 1
     fi
     
-    # Record the installation
-    record_installation "$package" "$github_version" "$target_path"
+    # Install completions if any
+    local installed_files=("$target_path")
+    if [ -n "$completions" ]; then
+        local comp_files
+        comp_files=($(install_completions "$package" "$completions"))
+        if [ ${#comp_files[@]} -gt 0 ]; then
+            installed_files+=("${comp_files[@]}")
+        fi
+    fi
+    
+    # Record the installation with all installed files
+    add_to_db "$package" "$github_version" "${installed_files[@]}"
     
     print_color "$GREEN" "Successfully installed $package"
     return 0
@@ -1073,30 +1084,37 @@ parse_binary_version() {
 
 # Function to list installed packages
 list_installed_packages() {
-    local target_dir="$HOME/.local/bin"
-    local db_file="$DATA_DIR/installed.db"
+    local db_content
+    db_content=$(db_ops read "")  # Get all packages
+    
+    if [ ! -f "$DB_FILE" ] || [ "$(jq '.packages | length' "$DB_FILE")" = "0" ]; then
+        echo "No packages installed yet."
+        return
+    fi
     
     echo "Packages managed by ghr-installer:"
     echo
     printf "%-15s %-12s %-20s\n" "Package" "Version" "Location"
     echo "-------------------------------------------------------"
     
-    # Read each line from installed.db if it exists
-    if [ -f "$db_file" ]; then
-        while IFS='|' read -r package version path timestamp; do
-            if [ -f "$path" ]; then
+    # Read from JSON database
+    while IFS= read -r package; do
+        local info=$(db_ops read "$package")
+        if [ -n "$info" ]; then
+            local version=$(echo "$info" | jq -r '.version')
+            local binary_path=$(echo "$info" | jq -r '.files[0]')  # First file is always the binary
+            
+            if [ -f "$binary_path" ]; then
                 # Try to get current version
-                local version_output=$("$path" --version 2>/dev/null | head -n1 || echo "Unknown")
-                local current_version=$(parse_binary_version "$path" "$version_output")
+                local version_output=$("$binary_path" --version 2>/dev/null | head -n1 || echo "Unknown")
+                local current_version=$(parse_binary_version "$binary_path" "$version_output")
                 printf "%-15s %-12s %-20s\n" \
                     "$package" \
                     "$current_version" \
-                    "$path"
+                    "$binary_path"
             fi
-        done < "$db_file"
-    else
-        echo "No packages installed yet."
-    fi
+        fi
+    done < <(jq -r '.packages | keys[]' "$DB_FILE")
 }
 
 # Function to install selected packages
