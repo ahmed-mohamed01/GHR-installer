@@ -4,7 +4,7 @@
 INSTALL_DIR="$PWD/.local/bin"
 DATA_DIR="$PWD/.local/share/ghr-installer"
 DB_FILE="$DATA_DIR/packages.json"
-CACHE_DIR="$DATA_DIR"
+CACHE_DIR="$DATA_DIR/cache"
 CACHE_FILE="$CACHE_DIR/api-cache.json"
 ASSETS_CACHE_DIR="$CACHE_DIR/assets"
 CACHE_TTL=3600  # 1 hour in seconds
@@ -367,7 +367,20 @@ cache_ops() {
             echo "$cache_data" | jq -r '.latest_release // empty'
             return 0
             ;;
-        # ... rest of the function remains the same
+        set)
+            local temp_file=$(mktemp)
+            jq --arg repo "$repo" \
+               --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+               --argjson data "$data" \
+               --argjson size "${#data}" \
+               '.repositories[$repo] = {
+                   "last_checked": $time,
+                   "size": $size,
+                   "latest_release": $data
+               }' "$CACHE_FILE" > "$temp_file"
+            
+            mv "$temp_file" "$CACHE_FILE"
+            ;;
     esac
 }
 # Function to check if binary exists in PATH
@@ -487,14 +500,6 @@ check_script_dependencies() {
             print_color "$RED" "Required dependencies must be installed to continue."
             exit 1
         fi
-    fi
-}
-
-# Function to initialize cache
-init_cache() {
-    mkdir -p "$CACHE_DIR" "$ASSETS_CACHE_DIR"
-    if [ ! -f "$CACHE_FILE" ]; then
-        echo "{}" > "$CACHE_FILE"
     fi
 }
 
@@ -791,7 +796,7 @@ install_github_version() {
     
     # Check if binary works
     if ! "$target_path" --version >/dev/null 2>&1; then
-        print_color "$RED" "Warning: Installed binary may not work correctly"
+        print_color "$RED" "Warning: Incompatible binary for $package, skipping."
         return 1
     fi
     
@@ -1120,53 +1125,17 @@ get_apt_version() {
     fi
 }
 
-# Function to parse version from --version output
-parse_binary_version() {
-    local binary=$1
-    local version_output=$2
-    local version=""
-    
-    case "$(basename "$binary")" in
-        "bat")
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            ;;
-        "eza")
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            if [ -z "$version" ]; then
-                # Try getting version from binary directly
-                version=$("$binary" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            fi
-            ;;
-        "fd")
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            ;;
-        "fzf")
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            ;;
-        "micro")
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            ;;
-        "zoxide")
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            ;;
-        *)
-            # Generic version number extraction
-            version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-            ;;
-    esac
-    
-    echo "${version:-Unknown}"
-}
-
 # Function to list installed packages
 list_installed_packages() {
     # First check if database exists and has packages
     if [ ! -f "$DB_FILE" ] || [ "$(jq '.packages | length' "$DB_FILE")" = "0" ]; then
+        echo # empty line at top for better spacing. 
         echo "No packages installed yet."
         return 0
     fi
 
     # Since we have packages, show the header
+    echo # empty line at the top
     echo "Packages managed by ghr-installer:"
     echo
     printf "%-15s %-12s %-20s\n" "Package" "Version" "Location"
@@ -1177,11 +1146,18 @@ list_installed_packages() {
     while read -r package version file; do
         if [ -f "$file" ]; then
             # Try to get current version
-            local version_output=$("$file" --version 2>/dev/null | head -n1 || echo "Unknown")
-            local current_version=$(parse_binary_version "$file" "$version_output")
+            local version_output=$("$file" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo "Unknown")
+            # Fallback to database version if binary output doesn't match
+            local current_version="${version_output:-$db_version}"
             printf "%-15s %-12s %-20s\n" \
                 "$package" \
                 "$current_version" \
+                "$file"
+        else
+            # Handle missing files
+            printf "%-15s %-12s %-20s\n" \
+                "$package" \
+                "$db_version (file missing)" \
                 "$file"
         fi
     done
@@ -1251,7 +1227,7 @@ clear_cache() {
     print_color "$BLUE" "Purging cache..."
     rm -rf "$CACHE_DIR"
     mkdir -p "$CACHE_DIR" "$ASSETS_CACHE_DIR"
-    touch "$CACHE_DIR/api-cache.json"
+    touch "$CACHE_FILE"
     print_color "$GREEN" "Cache purged!"
     exit 0  # Exit after clearing cache
 }
@@ -1425,4 +1401,6 @@ main() {
 }
 
 # Execute main function with all arguments
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

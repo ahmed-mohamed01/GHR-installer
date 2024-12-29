@@ -5,4 +5,3 @@ junegunn/fzf
 zyedidia/micro
 ajeetdsouza/zoxide
 eza-community/eza
-sharkdp/fd
