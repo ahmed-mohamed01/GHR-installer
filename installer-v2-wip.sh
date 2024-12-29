@@ -82,12 +82,25 @@ db_ops() {
     local package=$2
     local data=$3
     
+    print_color "$BLUE" "Debug: db_ops called with operation: $operation, package: $package"
+    
     case "$operation" in
         read)
             if [ ! -f "$DB_FILE" ]; then
+                print_color "$YELLOW" "Debug: DB_FILE not found in db_ops read"
                 return 1
             fi
-            jq -r --arg pkg "$package" '.packages[$pkg] // empty' "$DB_FILE"
+            
+            print_color "$BLUE" "Debug: Executing jq query for package: $package"
+            local query_result
+            query_result=$(jq -r --arg pkg "$package" '.packages[$pkg] // empty' "$DB_FILE")
+            local jq_status=$?
+            
+            print_color "$BLUE" "Debug: jq returned status: $jq_status"
+            print_color "$BLUE" "Debug: jq returned result: '$query_result'"
+            
+            echo "$query_result"
+            return $jq_status
             ;;
         write)
             local temp_file=$(mktemp)
@@ -163,7 +176,32 @@ remove_from_db() {
 # Function to get package info from database
 get_package_info() {
     local package=$1
-    db_ops get "$package"
+    
+    # Debug output to stderr
+    print_color "$BLUE" "Debug: Attempting to get info for package: '$package'" >&2
+    
+    if [ ! -f "$DB_FILE" ]; then
+        print_color "$YELLOW" "Debug: Database file does not exist" >&2
+        return 1
+    fi
+    
+    # Get the raw JSON data without debug output
+    local info
+    info=$(jq -r --arg pkg "$package" '.packages[$pkg]' "$DB_FILE")
+    local query_status=$?
+    
+    # Debug output to stderr
+    print_color "$BLUE" "Debug: Query status: $query_status" >&2
+    print_color "$BLUE" "Debug: Query result: '$info'" >&2
+    
+    if [ -z "$info" ] || [ "$info" = "null" ]; then
+        print_color "$YELLOW" "Debug: No info found for package $package" >&2
+        return 1
+    fi
+    
+    # Return clean JSON data to stdout
+    echo "$info"
+    return 0
 }
 
 # Function to check if a package is installed via ghr-installer
@@ -195,35 +233,73 @@ get_installed_version() {
 # Function to remove a package
 remove_package() {
     local package=$1
-    if ! check_installed "$package"; then
+    print_color "$BLUE" "Debug: Starting remove_package for: $package" >&2
+    
+    # Get package info from database, returns clean JSON
+    local info
+    info=$(get_package_info "$package")
+    local get_status=$?
+    
+    # Check if package exists in database
+    if [ $get_status -ne 0 ] || [ -z "$info" ] || [ "$info" = "null" ]; then
+        print_color "$RED" "Package $package is not managed by ghr-installer"
         return 1
     fi
     
-    local info=$(get_package_info "$package")
-    local version=$(echo "$info" | jq -r '.version')
-    local files=$(echo "$info" | jq -r '.files[]')
+    # Parse version and files from JSON info
+    local version files
+    version=$(echo "$info" | jq -r '.version')
+    files=$(echo "$info" | jq -r '.files[]')
     
-    print_color "$BOLD" "Removing $package version $version..."
+    # Show removal information
+    echo
+    print_color "$BOLD" "Remove $package $version?"
+    echo
+    echo "This will remove the following files:"
+    echo
+    while IFS= read -r file; do
+        echo "  $file"
+    done <<< "$files"
+    echo
     
-    # Remove all installed files
+    # Ask for confirmation
+    read -r -p "Proceed? [y/N] " response
+    echo    # Add newline after response
+    
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        print_color "$YELLOW" "Operation cancelled"
+        return 0
+    fi
+    
+    # Remove files
+    local remove_failed=0
     while IFS= read -r file; do
         if [ -f "$file" ]; then
-            rm -f "$file"
-            echo "Removed: $file"
+            if rm -f "$file"; then
+                echo "Removed: $file"
+            else
+                print_color "$RED" "Failed to remove: $file"
+                remove_failed=1
+            fi
+        else
+            print_color "$YELLOW" "File not found (already removed): $file"
         fi
     done <<< "$files"
     
-    # Remove from database
-    remove_from_db "$package"
-    
-    print_color "$GREEN" "Successfully removed $package"
-    
-    # Check for orphaned dependencies
-    echo -e "\n${BOLD}Checking for orphaned dependencies...${NC}"
-    if command -v apt >/dev/null 2>&1; then
-        echo "You can check for orphaned packages using:"
-        print_color "$YELLOW" "sudo apt autoremove"
+    # Remove package entry from database
+    if ! remove_from_db "$package"; then
+        print_color "$RED" "Failed to update database"
+        return 1
     fi
+    
+    # Final status report
+    if [ $remove_failed -eq 0 ]; then
+        print_color "$GREEN" "Successfully removed $package"
+    else
+        print_color "$YELLOW" "Some files could not be removed. Database entry has been removed."
+    fi
+    
+    return $remove_failed
 }
 
 # New cache initialization
@@ -1084,37 +1160,31 @@ parse_binary_version() {
 
 # Function to list installed packages
 list_installed_packages() {
-    local db_content
-    db_content=$(db_ops read "")  # Get all packages
-    
+    # First check if database exists and has packages
     if [ ! -f "$DB_FILE" ] || [ "$(jq '.packages | length' "$DB_FILE")" = "0" ]; then
         echo "No packages installed yet."
-        return
+        return 0
     fi
-    
+
+    # Since we have packages, show the header
     echo "Packages managed by ghr-installer:"
     echo
     printf "%-15s %-12s %-20s\n" "Package" "Version" "Location"
     echo "-------------------------------------------------------"
     
-    # Read from JSON database
-    while IFS= read -r package; do
-        local info=$(db_ops read "$package")
-        if [ -n "$info" ]; then
-            local version=$(echo "$info" | jq -r '.version')
-            local binary_path=$(echo "$info" | jq -r '.files[0]')  # First file is always the binary
-            
-            if [ -f "$binary_path" ]; then
-                # Try to get current version
-                local version_output=$("$binary_path" --version 2>/dev/null | head -n1 || echo "Unknown")
-                local current_version=$(parse_binary_version "$binary_path" "$version_output")
-                printf "%-15s %-12s %-20s\n" \
-                    "$package" \
-                    "$current_version" \
-                    "$binary_path"
-            fi
+    # Process each package from the JSON file directly
+    jq -r '.packages | to_entries[] | "\(.key) \(.value.version) \(.value.files[0])"' "$DB_FILE" | \
+    while read -r package version file; do
+        if [ -f "$file" ]; then
+            # Try to get current version
+            local version_output=$("$file" --version 2>/dev/null | head -n1 || echo "Unknown")
+            local current_version=$(parse_binary_version "$file" "$version_output")
+            printf "%-15s %-12s %-20s\n" \
+                "$package" \
+                "$current_version" \
+                "$file"
         fi
-    done < <(jq -r '.packages | keys[]' "$DB_FILE")
+    done
 }
 
 # Function to install selected packages
@@ -1216,7 +1286,7 @@ main() {
     init_cache
     
     # Print system info once at start
-    print_system_info
+    #print_system_info
     
     # Parse command line arguments
     while [ $# -gt 0 ]; do
@@ -1233,7 +1303,7 @@ main() {
                     exit 1
                 fi
                 process_github_binary "$repo" "update"
-                shift 2
+                exit $?
                 ;;
             --remove|-r)
                 if [ -z "$2" ]; then
@@ -1242,7 +1312,7 @@ main() {
                     exit 1
                 fi
                 remove_package "$2"
-                shift 2
+                exit $?
                 ;;
             --list|-l)
                 list_installed_packages
