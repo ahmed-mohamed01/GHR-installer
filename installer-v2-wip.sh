@@ -79,68 +79,44 @@ unlock_db() {
 # Database operations wrapper
 db_ops() {
     local operation=$1
-    shift
-
+    local package=$2
+    local data=$3
+    
     case "$operation" in
-        get)
-            local key=$1
+        read)
             if [ ! -f "$DB_FILE" ]; then
-                echo '{}'
-                return
+                return 1
             fi
-            jq -r --arg key "$key" '.packages[$key] // empty' "$DB_FILE"
+            jq -r --arg pkg "$package" '.packages[$pkg] // empty' "$DB_FILE"
             ;;
-        set)
-            local key=$1
-            local value=$2
-            mkdir -p "$(dirname "$DB_FILE")"
+        write)
+            local temp_file=$(mktemp)
             if [ ! -f "$DB_FILE" ]; then
-                echo '{"version":1,"packages":{}}' > "$DB_FILE"
+                echo '{"db_version":"1.0","packages":{}}' > "$DB_FILE"
             fi
-            local temp_file="${DB_FILE}.tmp"
-            jq --arg key "$key" --argjson value "$value" '.packages[$key] = $value' "$DB_FILE" > "$temp_file"
-            mv "$temp_file" "$DB_FILE"
+            
+            jq --arg pkg "$package" \
+               --argjson data "$data" \
+               --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+               '.last_updated = $time | .packages[$pkg] = $data' "$DB_FILE" > "$temp_file"
+            
+            if [ $? -eq 0 ]; then
+                mv "$temp_file" "$DB_FILE"
+                # Create backup
+                cp "$DB_FILE" "${DB_FILE}.backup"
+            else
+                rm "$temp_file"
+                return 1
+            fi
             ;;
         delete)
-            local key=$1
             if [ -f "$DB_FILE" ]; then
-                local temp_file="${DB_FILE}.tmp"
-                jq --arg key "$key" 'del(.packages[$key])' "$DB_FILE" > "$temp_file"
+                local temp_file=$(mktemp)
+                jq --arg pkg "$package" 'del(.packages[$pkg])' "$DB_FILE" > "$temp_file"
                 mv "$temp_file" "$DB_FILE"
             fi
             ;;
-        list)
-            if [ ! -f "$DB_FILE" ]; then
-                return
-            fi
-            jq -r '.packages | keys[]' "$DB_FILE"
-            ;;
-        query)
-            local query=$1
-            if [ ! -f "$DB_FILE" ]; then
-                echo '{}'
-                return
-            fi
-            jq "$query" "$DB_FILE"
-            ;;
     esac
-}
-
-# Function to read database
-read_db() {
-    if [ ! -f "$DB_FILE" ]; then
-        echo '{"version":1,"packages":{}}'
-        return
-    fi
-    cat "$DB_FILE"
-}
-
-# Function to write database
-write_db() {
-    local content="$1"
-    if [ -n "$content" ]; then
-        echo "$content" > "$DB_FILE"
-    fi
 }
 
 # Function to add entry to database
@@ -148,7 +124,7 @@ add_to_db() {
     local package=$1
     local version=$2
     shift 2
-    local files=("$@")
+    local -a files=("$@")
     
     if ! lock_db; then
         return 1
@@ -159,9 +135,16 @@ add_to_db() {
         --arg ver "$version" \
         --argjson files "$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)" \
         --arg ts "$timestamp" \
-        '{version: $ver, files: $files, installed_at: $ts, updated_at: $ts}')
+        --arg src "github" \
+        '{
+            "version": $ver,
+            "files": $files,
+            "installed_at": $ts,
+            "updated_at": $ts,
+            "source": $src
+        }')
     
-    db_ops set "$package" "$entry"
+    db_ops write "$package" "$entry"
     unlock_db
 }
 
@@ -243,6 +226,74 @@ remove_package() {
     fi
 }
 
+# New cache initialization
+init_cache() {
+    mkdir -p "$CACHE_DIR"
+    if [ ! -f "$CACHE_FILE" ]; then
+        echo '{
+            "cache_version": "1.0",
+            "settings": {
+                "ttl": 3600,
+                "max_size": 50000000
+            },
+            "repositories": {}
+        }' > "$CACHE_FILE"
+    fi
+    mkdir -p "$ASSETS_CACHE_DIR"
+    
+    # Clean old assets
+    find "$ASSETS_CACHE_DIR" -type f -mtime +30 -delete 2>/dev/null
+}
+
+# New cache operations
+cache_ops() {
+    local operation=$1
+    local repo=$2
+    local data=$3
+    
+    case "$operation" in
+        get)
+            if [ "$OVERRIDE_CACHE" -eq 1 ]; then
+                return 1
+            fi
+            
+            local cache_data=$(jq -r --arg repo "$repo" \
+                '.repositories[$repo] // empty' "$CACHE_FILE")
+            
+            if [ -z "$cache_data" ] || [ "$cache_data" = "null" ]; then
+                return 1
+            fi
+            
+            # Check TTL with proper null handling
+            local ttl=$(jq -r '.settings.ttl // 3600' "$CACHE_FILE")
+            local last_checked
+            last_checked=$(echo "$cache_data" | jq -r '.last_checked // empty')
+            
+            if [ -z "$last_checked" ] || [ "$last_checked" = "null" ]; then
+                return 1
+            fi
+            
+            # Convert timestamps safely
+            local current_time=$(date -u +%s)
+            local last_checked_ts
+            if ! last_checked_ts=$(date -u -d "$last_checked" +%s 2>/dev/null); then
+                return 1
+            fi
+            
+            # Safe integer comparison
+            if [ -n "$last_checked_ts" ] && [ -n "$ttl" ] && \
+               [ "$last_checked_ts" -gt 0 ] && [ "$ttl" -gt 0 ] && \
+               [ $((current_time - last_checked_ts)) -gt "$ttl" ]; then
+                return 1
+            fi
+            
+            # If we get here, cache is valid
+            echo "$cache_data" | jq -r '.latest_release // empty'
+            return 0
+            ;;
+        # ... rest of the function remains the same
+    esac
+}
 # Function to check if binary exists in PATH
 check_binary_exists() {
     local binary=$1
@@ -308,32 +359,11 @@ check_installation_status() {
 init_db() {
     mkdir -p "$DATA_DIR"
     if [ ! -f "$DB_FILE" ]; then
-        echo '{"packages":{}}' > "$DB_FILE"
-    else
-        # Check database version and migrate if needed
-        local version=$(jq -r '.version // 0' "$DB_FILE")
-        if [ "$version" = "0" ]; then
-            # Migrate old format to new format
-            local new_db='{"version":1,"packages":{}}'
-            while IFS='|' read -r pkg ver files || [ -n "$pkg" ]; do
-                [ -z "$pkg" ] && continue
-                local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-                local files_array=""
-                IFS=',' read -ra file_list <<< "$files"
-                for file in "${file_list[@]}"; do
-                    files_array="$files_array\"$file\","
-                done
-                files_array="[${files_array%,}]"
-                
-                local new_entry=$(jq -n \
-                    --arg ver "$ver" \
-                    --argjson files "$files_array" \
-                    --arg ts "$timestamp" \
-                    '{version: $ver, files: $files, installed_at: $ts, updated_at: $ts}')
-                new_db=$(echo "$new_db" | jq --arg pkg "$pkg" --argjson entry "$new_entry" '.packages[$pkg] = $entry')
-            done < "$DB_FILE"
-            write_db "$new_db"
-        fi
+        echo '{
+            "db_version": "1.0",
+            "last_updated": "",
+            "packages": {}
+        }' > "$DB_FILE"
     fi
 }
 
@@ -393,6 +423,7 @@ init_cache() {
 }
 
 # Function to get cached release
+# Function to get cached release
 get_cached_release() {
     local repo=$1
     
@@ -401,35 +432,41 @@ get_cached_release() {
         return 1
     fi
     
-    local cache_data
-    local last_checked
-    local current_time
-    
     # Check if cache exists and is readable
     if [ ! -r "$CACHE_FILE" ]; then
         return 1
     fi
     
     # Try to get cached data
+    local cache_data
     cache_data=$(jq -r --arg repo "$repo" '.repositories[$repo] // empty' "$CACHE_FILE")
-    if [ -z "$cache_data" ]; then
+    if [ -z "$cache_data" ] || [ "$cache_data" = "null" ]; then
         return 1
     fi
     
-    # Check if cache is still valid
+    # Get last checked timestamp
+    local last_checked
     last_checked=$(echo "$cache_data" | jq -r '.last_checked')
-    current_time=$(date -u +%s)
-    last_checked_ts=$(date -u -d "$last_checked" +%s 2>/dev/null)
+    if [ -z "$last_checked" ] || [ "$last_checked" = "null" ]; then
+        return 1
+    fi
     
-    if [ $? -eq 0 ] && [ $((current_time - last_checked_ts)) -lt "$CACHE_TTL" ]; then
-        # Cache is valid, return the cached release
+    # Convert timestamps and compare
+    local current_time=$(date -u +%s)
+    local last_checked_ts
+    last_checked_ts=$(date -u -d "$last_checked" +%s 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$last_checked_ts" ]; then
+        return 1
+    fi
+    
+    # Only now do the integer comparison
+    if [ $((current_time - last_checked_ts)) -lt "$CACHE_TTL" ]; then
         echo "$cache_data" | jq -r '.latest_release'
         return 0
     fi
     
     return 1
 }
-
 # Function to update cache
 update_cache() {
     local repo=$1
@@ -455,51 +492,31 @@ get_github_release() {
     local repo=$1
     local response
     
-    # Try to get from cache first
-    response=$(get_cached_release "$repo")
+    # Try cache first
+    response=$(cache_ops get "$repo")
     if [ $? -eq 0 ]; then
-        echo "$response"
+        echo "$response" | jq -r '.latest_release'
         return 0
     fi
     
-    # If not in cache or expired, fetch from GitHub API
+    # Fetch from GitHub API
     local auth_header=""
     if [ -n "$GITHUB_TOKEN" ]; then
         auth_header="Authorization: Bearer $GITHUB_TOKEN"
     fi
     
-    # First check rate limit
-    local rate_limit_response=$(curl -s -I -H "$auth_header" \
-        "https://api.github.com/rate_limit")
-    
-    if echo "$rate_limit_response" | grep -q "^X-RateLimit-Remaining: 0"; then
-        print_color "$RED" "GitHub API rate limit exceeded. Please set GITHUB_TOKEN environment variable." >&2
-        return 1
-    fi
-    
-    # Fetch release info
     response=$(curl -s -H "$auth_header" \
         "https://api.github.com/repos/$repo/releases/latest")
     
-    # Check for API errors
-    if [ -n "$(echo "$response" | jq -r '.message // empty')" ]; then
-        local error_msg=$(echo "$response" | jq -r '.message')
-        print_color "$RED" "GitHub API error: $error_msg" >&2
-        return 1
+    # Update cache if successful
+    if [ $? -eq 0 ] && echo "$response" | jq -e . >/dev/null 2>&1; then
+        if [ -z "$(echo "$response" | jq -r '.message // empty')" ]; then
+            cache_ops set "$repo" "$response"
+        fi
     fi
-    
-    # Validate response has required fields
-    if ! echo "$response" | jq -e '.assets' >/dev/null 2>&1; then
-        print_color "$RED" "Invalid response from GitHub API for $repo" >&2
-        return 1
-    fi
-    
-    # If successful, update cache
-    update_cache "$repo" "$response"
     
     echo "$response"
 }
-
 # Function to find appropriate binary asset
 find_binary_asset() {
     local release=$1
@@ -518,13 +535,6 @@ find_binary_asset() {
         *)
             print_color "$RED" "Unsupported architecture: $arch" >&2
             return 1
-            ;;
-    esac
-    
-    # Special handling for packages with simpler naming
-    case "$package" in
-        "tldr")
-            patterns=(".*linux.*")  # tldr uses simpler naming
             ;;
     esac
     
@@ -1087,30 +1097,6 @@ list_installed_packages() {
     else
         echo "No packages installed yet."
     fi
-}
-
-# Function to record installation in database
-record_installation() {
-    local package=$1
-    local version=$2
-    local path=$3
-    local timestamp=$(date +%s)
-    local db_file="$DATA_DIR/installed.db"
-    local temp_file="$DATA_DIR/installed.db.tmp"
-    
-    # Create data directory if it doesn't exist
-    mkdir -p "$DATA_DIR"
-    
-    # Remove existing entry for this package
-    if [ -f "$db_file" ]; then
-        grep -v "^$package|" "$db_file" > "$temp_file" 2>/dev/null
-    fi
-    
-    # Add new entry
-    echo "$package|$version|$path|$timestamp" >> "$temp_file"
-    
-    # Replace original file
-    mv "$temp_file" "$db_file"
 }
 
 # Function to install selected packages
